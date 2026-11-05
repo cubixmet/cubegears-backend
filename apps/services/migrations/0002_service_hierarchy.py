@@ -21,6 +21,16 @@ class Migration(migrations.Migration):
         ),
         migrations.AddField(
             model_name="service",
+            name="pricing_type",
+            field=models.CharField(max_length=30, default="Fixed"),
+        ),
+        migrations.AddField(
+            model_name="service",
+            name="checklist",
+            field=models.JSONField(default=list, blank=True),
+        ),
+        migrations.AddField(
+            model_name="service",
             name="tax_treatment",
             field=models.CharField(
                 max_length=20, default="taxable",
