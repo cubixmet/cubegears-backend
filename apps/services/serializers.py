@@ -43,6 +43,11 @@ class ServiceSerializer(serializers.ModelSerializer):
     taxRate = serializers.DecimalField(
         source="tax_rate", max_digits=5, decimal_places=2, required=False,
     )
+    pricingType = serializers.ChoiceField(
+        source="pricing_type", choices=("Fixed", "Starting", "Inspection Based"),
+        required=False,
+    )
+    durationMinutes = serializers.SerializerMethodField()
     taxTreatment = serializers.ChoiceField(
         source="tax_treatment", choices=(
             "taxable", "exempt", "nil_rated", "non_gst", "out_of_scope",
@@ -51,7 +56,10 @@ class ServiceSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Service
-        exclude = ("company", "branch", "category", "hsn_sac", "tax_rate", "tax_treatment")
+        exclude = ("company", "branch", "category", "hsn_sac", "tax_rate", "tax_treatment", "pricing_type")
+
+    def get_durationMinutes(self, obj):
+        return int(obj.labour_hours * 60)
 
     def validate(self, attrs):
         category = attrs.get("category", getattr(self.instance, "category", None))
