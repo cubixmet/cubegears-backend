@@ -83,7 +83,7 @@ class JobInvoiceDraftTests(TestCase):
         self.assertEqual(set(row["description"] for row in rows),
                          {"Brake Pad", "Panel painting", "Special paint"})
         part = next(row for row in rows if row["description"] == "Brake Pad")
-        self.assertEqual(part["qty"], "2")
+        self.assertEqual(Decimal(part["qty"]), Decimal("2"))
         self.assertEqual(part["rate"], "450.00")
         self.assertEqual(part["inventoryId"], "")
         self.assertEqual(part["type"], "Custom Item")
