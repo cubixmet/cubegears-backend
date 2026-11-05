@@ -69,6 +69,12 @@ class ManualComplaintTests(TestCase):
         self.assertEqual(self.client.post(self.url("workflow"), {
             "stage": "work", "confirmWorkDone": True,
         }, format="json").status_code, 400)
+        # An arbitrary truthy string must never count as recorded consent.
+        not_acknowledged = self.client.post(self.url("workflow"), {
+            "stage": "work", "confirmWorkDone": True,
+            "confirmUnresolvedComplaints": "true",
+        }, format="json")
+        self.assertEqual(not_acknowledged.status_code, 400)
         ack = self.client.post(self.url("workflow"), {
             "stage": "work", "confirmWorkDone": True,
             "confirmUnresolvedComplaints": True,
