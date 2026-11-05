@@ -43,7 +43,9 @@ class WorkspaceSearchView(APIView):
             return Response({"message": "Search query must contain at most 100 characters."}, status=400)
         q = raw.strip()
         if len(q) < 2:
-            return Response({"query": q, "results": [], "total": 0})
+            reply = Response({"query": q, "results": [], "total": 0})
+            reply["Cache-Control"] = "private, no-store"
+            return reply
         limit_raw = request.query_params.get("limit", "8")
         try:
             limit = int(limit_raw)
