@@ -73,7 +73,7 @@ class JobInvoiceDraftTests(TestCase):
         self.url = "/api/v1/billing/documents/job-draft?jobId=" + str(self.job.pk)
 
     def test_only_recorded_billable_revenue_is_suggested_and_endpoint_never_posts(self):
-        before = (Invoice.objects.count(), StockMovement.objects.count(), self.stock.on_hand)
+        before = (Invoice.objects.count(), StockMovement.objects.count(), Decimal(str(self.stock.on_hand)))
         res = self.client.get(self.url)
         self.assertEqual(res.status_code, 200, getattr(res, "data", None))
         self.assertFalse(res.data["created"])
@@ -86,6 +86,8 @@ class JobInvoiceDraftTests(TestCase):
         self.assertEqual(part["qty"], "2")
         self.assertEqual(part["rate"], "450.00")
         self.assertEqual(part["inventoryId"], "")
+        self.assertEqual(part["type"], "Custom Item")
+        self.assertEqual(part["code"], "PAD-01")
         paint = next(row for row in rows if row["description"] == "Special paint")
         self.assertEqual(paint["rate"], "800.00")
         self.assertEqual(paint["inventoryId"], "")
