@@ -578,6 +578,8 @@ class JobViewSet(CompanyScopedModelViewSet):
         elif stage == "work":
             if not request.data.get("confirmWorkDone"):
                 raise ValidationError({"stage":"Confirm that workshop work is complete."})
+            if unresolved_complaints(job) and not request.data.get("confirmUnresolvedComplaints"):
+                raise ValidationError({"complaints": "Review unresolved customer complaints and explicitly acknowledge them before QC."})
             self._guard_active_timers(job, "QC")
         elif stage == "qc":
             qc = job.qc or {}
@@ -604,6 +606,12 @@ class JobViewSet(CompanyScopedModelViewSet):
             "completed": [name for name in STAGES if name in completed],
             "lastCompletedAt": timezone.now().isoformat(),
         })
+        if stage == "work" and unresolved_complaints(job):
+            progress["complaintReview"] = {
+                "unresolvedCount": len(unresolved_complaints(job)),
+                "acknowledgedBy": str(request.user.pk),
+                "acknowledgedAt": timezone.now().isoformat(),
+            }
         old_status = job.status
         job.workflow_progress = progress
         job.status = NEXT_STATUS[stage]
@@ -664,9 +672,17 @@ class JobViewSet(CompanyScopedModelViewSet):
                 "work": "Work, labour, or parts have already been recorded. Finish Work normally instead of skipping."
             })
         self._guard_active_timers(job, "QC")
+        if unresolved_complaints(job) and not request.data.get("confirmUnresolvedComplaints"):
+            raise ValidationError({"complaints": "Review unresolved customer complaints before skipping work and advancing to QC."})
 
         now = timezone.now().isoformat()
         progress = dict(job.workflow_progress or {})
+        if unresolved_complaints(job):
+            progress["complaintReview"] = {
+                "unresolvedCount": len(unresolved_complaints(job)),
+                "acknowledgedBy": str(request.user.pk),
+                "acknowledgedAt": now,
+            }
         completed = set(workflow_state(job)["completed"])
         completed.add("work")
         skipped = set(progress.get("skipped") or [])
