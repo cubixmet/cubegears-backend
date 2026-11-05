@@ -578,7 +578,7 @@ class JobViewSet(CompanyScopedModelViewSet):
         elif stage == "work":
             if not request.data.get("confirmWorkDone"):
                 raise ValidationError({"stage":"Confirm that workshop work is complete."})
-            if unresolved_complaints(job) and not request.data.get("confirmUnresolvedComplaints"):
+            if unresolved_complaints(job) and request.data.get("confirmUnresolvedComplaints") is not True:
                 raise ValidationError({"complaints": "Review unresolved customer complaints and explicitly acknowledge them before QC."})
             self._guard_active_timers(job, "QC")
         elif stage == "qc":
@@ -672,7 +672,7 @@ class JobViewSet(CompanyScopedModelViewSet):
                 "work": "Work, labour, or parts have already been recorded. Finish Work normally instead of skipping."
             })
         self._guard_active_timers(job, "QC")
-        if unresolved_complaints(job) and not request.data.get("confirmUnresolvedComplaints"):
+        if unresolved_complaints(job) and request.data.get("confirmUnresolvedComplaints") is not True:
             raise ValidationError({"complaints": "Review unresolved customer complaints before skipping work and advancing to QC."})
 
         now = timezone.now().isoformat()
