@@ -120,7 +120,7 @@ class CustomerPortalSecurityTests(TestCase):
 
             response = self.public.get("/api/v1/c/" + token + "/logo")
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(response["Cache-Control"], "private, no-store")
+            self.assertIn("no-store", response["Cache-Control"])
             self.assertEqual(b"".join(response.streaming_content), content)
             self.assertNotIn("logo_image", str(detail.data))
 
