@@ -69,7 +69,6 @@ def suggested_job_invoice(job):
                     for x in row.get("returns", []) if isinstance(x, dict)), Decimal("0"))
         if qty <= 0:
             continue
-        stock = job.company.stockitem_set.filter(pk=row["partId"]).first() if False else None
         from apps.inventory.models import StockItem
         stock = StockItem.objects.filter(company=job.company, pk=row["partId"]).first()
         if stock is None:
