@@ -25,17 +25,28 @@ def suggested_job_invoice(job):
     items, notices = [], []
     seen_stock = set()
 
-    def append(kind, key, description, quantity, rate, hsn="", tax=None, unit="PCS"):
+    def append(kind, key, description, quantity, rate, hsn="", tax=None, unit="PCS", code=""):
         qty, price = amount(quantity), amount(rate)
         if not description or qty is None or price is None or qty <= 0:
             notices.append(f"{kind} {key}: check its recorded selling quantity and rate.")
             return
-        # Item totals use the invoice engine; this is a read-only draft.
+        unit_name = str(unit or "PCS").strip().upper()
+        unit_name = {"PIECE": "PCS", "PIECES": "PCS", "JOB": "JOB",
+                     "HOUR": "HRS", "HOURS": "HRS", "NUMBER": "NOS"}.get(unit_name, unit_name)
+        supported = {"PCS", "NOS", "SET", "KG", "G", "LTR", "ML", "MTR", "CM", "BOX", "PACK", "PAIR",
+                     "HRS", "MIN", "DAY", "JOB", "ROLL", "BOTTLE", "BAG", "TON"}
+        if unit_name not in supported:
+            notices.append("Review the invoice unit for " + str(description)[:90] + ".")
+            unit_name = "PCS"
+
+        # An already-issued JobPart must be a descriptive line, not an invoice
+        # Stock Part reference; the latter would issue inventory a second time.
+        invoice_type = "Custom Item" if kind == "Stock Part" else kind
         items.append({
-            "id": f"job-{kind}-{key}", "type": kind,
-            "description": str(description).strip()[:250],
+            "id": f"job-{kind}-{key}", "type": invoice_type,
+            "description": str(description).strip()[:250], "code": str(code or "")[:80],
             "qty": str(qty), "rate": str(price.quantize(CENT, rounding=ROUND_HALF_UP)),
-            "unit": unit or "PCS", "hsnCode": str(hsn or "").strip()[:30],
+            "unit": unit_name, "hsnCode": str(hsn or "").strip()[:30],
             "taxRate": str(tax) if registered and tax is not None and amount(tax) is not None
                 and amount(tax) > 0 else ("" if registered else "0"),
             "discount": "0", "inventoryId": "",
@@ -52,7 +63,7 @@ def suggested_job_invoice(job):
         seen_stock.add(str(stock.pk))
         tax, hsn = item_rate(stock)
         append("Stock Part", str(part.pk), stock.name, part.quantity,
-               part.unit_price, hsn, tax, stock.unit)
+               part.unit_price, hsn, tax, stock.unit, stock.sku)
 
     # The other supported issue path stores signed issue/return events in
     # parts_workflow JSON and StockMovement, but not a JobPart row.
@@ -77,7 +88,7 @@ def suggested_job_invoice(job):
         tax, hsn = item_rate(stock)
         append("Stock Part", str(row.get("id") or stock.pk),
                row.get("partName") or stock.name, qty, row.get("sellingPrice"),
-               hsn, tax, stock.unit)
+               hsn, tax, stock.unit, stock.sku)
 
     for row in workflow.get("outsideParts") or []:
         if not isinstance(row, dict) or row.get("status", "Purchased") != "Purchased":
@@ -112,6 +123,10 @@ def suggested_job_invoice(job):
                row.get("customerRate") or row.get("unitPrice") or row.get("customerCharge"),
                row.get("hsnSac"), row.get("taxRate"), row.get("unit") or "Job")
 
+    if seen_stock or any(row.get("issues") for row in workflow.get("lines") or [] if isinstance(row, dict)):
+        notices.append("Previously issued stock is shown as descriptive invoice items. It will not be deducted again.")
+    if registered and any(not row["hsnCode"] or row["taxRate"] == "" for row in items):
+        notices.append("Verify HSN/SAC and applicable GST for every drafted item before saving.")
     if not items:
         notices.append("No verified billable Job Card items. Add customer charges manually; no invoice was created.")
 
