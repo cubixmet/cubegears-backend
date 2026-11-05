@@ -51,7 +51,7 @@ class ManualComplaintTests(TestCase):
         )
 
     def test_legacy_auto_completed_is_not_inferred_as_resolved(self):
-        reply = self.client.get(self.url(""))
+        reply = self.client.get(self.url("").rstrip("/"))
         self.assertEqual(reply.status_code, 200, reply.data)
         statuses = [row["status"] for row in reply.data["complaints"]]
         self.assertEqual(statuses, ["Pending", "Pending"])
