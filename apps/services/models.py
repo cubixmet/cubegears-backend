@@ -38,6 +38,8 @@ class Service(CompanyOwnedModel):
     tax_rate=models.DecimalField(max_digits=5,decimal_places=2,default=Decimal("18"))
     hsn_sac=models.CharField(max_length=20,blank=True)
     unit=models.CharField(max_length=30,default="Job")
+    pricing_type=models.CharField(max_length=30,default="Fixed")
+    checklist=models.JSONField(default=list,blank=True)
     tax_treatment=models.CharField(max_length=20,default="taxable",
         choices=[(key,key) for key in ("taxable","exempt","nil_rated","non_gst","out_of_scope")])
     is_active=models.BooleanField(default=True)
