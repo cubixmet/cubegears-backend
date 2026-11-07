@@ -103,10 +103,13 @@ INSTALLED_APPS = [
     "apps.saas",
     "apps.credits",
     "apps.control_panel",
+    "apps.finance",
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "common.request_ids.RequestIdMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -135,22 +138,89 @@ TEMPLATES = [{
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-# SQLite-only: no Prisma/PostgreSQL connection or DATABASE_URL is used.
-# For a persistent deployment, mount a writable volume and point this variable
-# to an absolute filename, e.g. /var/lib/cubixgear/db.sqlite3.
-SQLITE_DATABASE_PATH = Path(
-    (env("SQLITE_DATABASE_PATH") or str(BASE_DIR / "db.sqlite3"))
-).expanduser()
-if not SQLITE_DATABASE_PATH.is_absolute():
-    SQLITE_DATABASE_PATH = BASE_DIR / SQLITE_DATABASE_PATH
+# Production PostgreSQL (never silently switch the existing SQLite file).
+# Supply either DATABASE_URL OR POSTGRES_HOST / DB / USER / PASSWORD.
+# Local development remains SQLite unless PostgreSQL is explicitly selected.
+# Production requires PostgreSQL by default; an existing legacy SQLite host can
+# temporarily opt in with ALLOW_LEGACY_PRODUCTION_SQLITE=True during migration.
+DATABASE_URL = (env("DATABASE_URL") or "").strip()
+POSTGRES_HOST = (env("POSTGRES_HOST") or "").strip()
+POSTGRES_SSLMODE_RAW = (env("POSTGRES_SSLMODE") or "").strip()
+POSTGRES_SSLMODE = POSTGRES_SSLMODE_RAW or ("require" if not DEBUG else "prefer")
+POSTGRES_CONNECT_TIMEOUT_SECONDS = int(env("POSTGRES_CONNECT_TIMEOUT_SECONDS", 10))
+if not 1 <= POSTGRES_CONNECT_TIMEOUT_SECONDS <= 120:
+    raise ImproperlyConfigured("POSTGRES_CONNECT_TIMEOUT_SECONDS must be 1–120.")
+DB_CONN_MAX_AGE = int(env("DB_CONN_MAX_AGE", 60))
+if DB_CONN_MAX_AGE < 0:
+    raise ImproperlyConfigured("DB_CONN_MAX_AGE must be 0 or a positive integer.")
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": SQLITE_DATABASE_PATH,
-        "OPTIONS": {"timeout": 30},
+if DATABASE_URL and POSTGRES_HOST:
+    raise ImproperlyConfigured(
+        "Configure only DATABASE_URL or POSTGRES_HOST/POSTGRES_* fields, not both."
+    )
+
+if DATABASE_URL or POSTGRES_HOST:
+    if POSTGRES_SSLMODE not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+        raise ImproperlyConfigured("Invalid POSTGRES_SSLMODE.")
+    if DATABASE_URL:
+        import dj_database_url
+        database = dj_database_url.parse(
+            DATABASE_URL, conn_max_age=DB_CONN_MAX_AGE, conn_health_checks=True,
+        )
+        if database["ENGINE"] != "django.db.backends.postgresql":
+            raise ImproperlyConfigured("DATABASE_URL must use PostgreSQL (postgresql://).")
+    else:
+        required = ["POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"]
+        missing = [name for name in required if not (env(name) or "").strip()]
+        if missing:
+            raise ImproperlyConfigured(
+                "PostgreSQL connection is missing: " + ", ".join(missing)
+            )
+        try:
+            port = int(env("POSTGRES_PORT", "5432"))
+            if not 1 <= port <= 65535:
+                raise ValueError()
+        except (TypeError, ValueError) as exc:
+            raise ImproperlyConfigured("POSTGRES_PORT must be a valid TCP port.") from exc
+        database = {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": env("POSTGRES_DB"),
+            "USER": env("POSTGRES_USER"),
+            "PASSWORD": env("POSTGRES_PASSWORD"),
+            "HOST": POSTGRES_HOST,
+            "PORT": port,
+            "CONN_MAX_AGE": DB_CONN_MAX_AGE,
+            "CONN_HEALTH_CHECKS": True,
+        }
+    # Preserve stricter SSL options explicitly supplied by managed PostgreSQL URLs.
+    options = database.setdefault("OPTIONS", {})
+    if POSTGRES_SSLMODE_RAW:
+        options["sslmode"] = POSTGRES_SSLMODE
+    else:
+        options.setdefault("sslmode", POSTGRES_SSLMODE)
+    options.setdefault("connect_timeout", POSTGRES_CONNECT_TIMEOUT_SECONDS)
+    DATABASES = {"default": database}
+else:
+    if not DEBUG and not env_bool("ALLOW_LEGACY_PRODUCTION_SQLITE", False):
+        raise ImproperlyConfigured(
+            "Production needs PostgreSQL: set DATABASE_URL or POSTGRES_HOST and "
+            "POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD. Do not deploy before "
+            "backing up and migrating any existing SQLite data. Existing "
+            "SQLite-only hosts may temporarily use ALLOW_LEGACY_PRODUCTION_SQLITE=True."
+        )
+    SQLITE_DATABASE_PATH = Path(
+        env("SQLITE_DATABASE_PATH") or str(BASE_DIR / "db.sqlite3")
+    ).expanduser()
+    if not SQLITE_DATABASE_PATH.is_absolute():
+        SQLITE_DATABASE_PATH = BASE_DIR / SQLITE_DATABASE_PATH
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": SQLITE_DATABASE_PATH,
+            "OPTIONS": {"timeout": 30},
+        }
     }
-}
+
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
@@ -164,16 +234,35 @@ TIME_ZONE = env("DJANGO_TIME_ZONE", "Asia/Kolkata")
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_DIRS = [BASE_DIR / "static"]
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedStaticFilesStorage"},
+}
 MEDIA_URL = "/media/"
 # Public company logos must live on persistent storage in production.
 MEDIA_ROOT = Path(env("DJANGO_MEDIA_ROOT", str(BASE_DIR / "media"))).expanduser()
 if not MEDIA_ROOT.is_absolute():
     MEDIA_ROOT = BASE_DIR / MEDIA_ROOT
 # Outside MEDIA_ROOT: public /media/ routes must never expose private job photos.
-PRIVATE_JOB_MEDIA_ROOT = Path(env("PRIVATE_JOB_MEDIA_ROOT", str(BASE_DIR / "private_job_media")))
+PRIVATE_JOB_MEDIA_ROOT = Path(env("PRIVATE_JOB_MEDIA_ROOT", str(BASE_DIR / "private_job_media"))).expanduser()
+if not PRIVATE_JOB_MEDIA_ROOT.is_absolute():
+    PRIVATE_JOB_MEDIA_ROOT = BASE_DIR / PRIVATE_JOB_MEDIA_ROOT
+
+# Private inspection media may never be placed within a publicly served media
+# or static directory, including through a symlink. Fail at Django startup.
+public_media_path = MEDIA_ROOT.resolve()
+static_root_path = STATIC_ROOT.resolve()
+private_media_path = PRIVATE_JOB_MEDIA_ROOT.resolve()
+if (private_media_path == public_media_path
+        or public_media_path in private_media_path.parents
+        or private_media_path == static_root_path
+        or static_root_path in private_media_path.parents):
+    raise ImproperlyConfigured(
+        "PRIVATE_JOB_MEDIA_ROOT must be outside DJANGO_MEDIA_ROOT and STATIC_ROOT."
+    )
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
@@ -194,6 +283,8 @@ WHATSAPP_WEBHOOK_VERIFY_TOKEN = env("WHATSAPP_WEBHOOK_VERIFY_TOKEN", "")
 WHATSAPP_TOKEN_ENCRYPTION_KEY = env("WHATSAPP_TOKEN_ENCRYPTION_KEY", "")
 WHATSAPP_GRAPH_VERSION = env("WHATSAPP_GRAPH_VERSION", "v25.0")
 WHATSAPP_SEND_ENABLED = env_bool("WHATSAPP_SEND_ENABLED", False)
+# Dedicated explicit opt-in. No automatic messages with unverified WABA/consent.
+STAFF_WHATSAPP_AUTO_SEND_ENABLED = env_bool("STAFF_WHATSAPP_AUTO_SEND_ENABLED", False)
 
 CUSTOMER_PORTAL_SIGNING_KEY = env("CUSTOMER_PORTAL_SIGNING_KEY", SECRET_KEY)
 CUSTOMER_PORTAL_BASE_URL = env("CUSTOMER_PORTAL_BASE_URL", "http://localhost:5174/access" if DEBUG else "https://customer.cubegears.com/access")
@@ -202,7 +293,7 @@ if not DEBUG and not CUSTOMER_PORTAL_BASE_URL.startswith("https://"):
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "apps.accounts.jwt_auth.CompanyJWTAuthentication",
     ),
     "DEFAULT_PERMISSION_CLASSES": (
         "rest_framework.permissions.IsAuthenticated",
@@ -230,6 +321,8 @@ CORS_ALLOWED_ORIGINS = env_list(
     "http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000",
 )
 CORS_ALLOW_CREDENTIALS = env_bool("CORS_ALLOW_CREDENTIALS", False)
+# Expose only the opaque request reference to cross-origin browser clients.
+CORS_EXPOSE_HEADERS = ["X-Request-ID"]
 
 # Use console mail locally, direct Django SMTP by default in production.
 # Override EMAIL_BACKEND in .env when a different provider is required.
@@ -290,6 +383,20 @@ LOGOUT_REDIRECT_URL = "panel:login"
 CREDIT_BILLING_CELERY_ENABLED = env_bool("CREDIT_BILLING_CELERY_ENABLED", False)
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", "")
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", "")
+REQUIRE_REDIS_READINESS = env_bool("REQUIRE_REDIS_READINESS", False)
+if REQUIRE_REDIS_READINESS and not CELERY_BROKER_URL.startswith(("redis://", "rediss://")):
+    raise ImproperlyConfigured(
+        "REQUIRE_REDIS_READINESS needs CELERY_BROKER_URL with redis:// or rediss://."
+    )
+# Web, Worker and Beat run in different OS processes/containers. Fail
+# explicitly if the worker/scheduler is deployed without its queue broker.
+SERVICE_ROLE = env("SERVICE_ROLE", "web").strip().lower()
+if SERVICE_ROLE not in {"web", "worker", "beat"}:
+    raise ImproperlyConfigured("SERVICE_ROLE must be web, worker or beat.")
+if SERVICE_ROLE in {"worker", "beat"} and not CELERY_BROKER_URL.startswith(("redis://", "rediss://")):
+    raise ImproperlyConfigured(
+        "Separate Celery workers and Beat require a Redis CELERY_BROKER_URL."
+    )
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_ENABLE_UTC = True
 CELERY_ACCEPT_CONTENT = ["json"]
