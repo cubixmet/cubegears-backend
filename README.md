@@ -65,7 +65,13 @@ DJANGO_ALLOWED_HOSTS=127.0.0.1,localhost
 SECURE_SSL_REDIRECT=False
 SESSION_COOKIE_SECURE=False
 CSRF_COOKIE_SECURE=False
-SQLITE_DATABASE_PATH=
+DB_ENGINE=django.db.backends.postgresql
+DB_NAME=cubixgear_db
+DB_USER=cubixgear_user
+DB_PASSWORD=
+DB_HOST=localhost
+DB_PORT=5432
+DB_CONN_MAX_AGE=0
 CELERY_BROKER_URL=redis://127.0.0.1:6379/0
 CELERY_RESULT_BACKEND=redis://127.0.0.1:6379/1
 CELERY_TASK_ALWAYS_EAGER=False
@@ -150,20 +156,49 @@ VITE_USE_MOCK_API=false
 
 The frontend already sends `Authorization: Bearer <access-token>`.
 
-## Database — SQLite only
+## Database — one DB_* format for local and production
 
-CubixGear now uses a SQLite database file by default, at `db.sqlite3` in the backend folder. No Prisma or PostgreSQL connection variables are needed.
+Every backend deployment reads the same seven database variables:
+`DB_ENGINE`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`,
+`DB_PORT` and `DB_CONN_MAX_AGE`. No `POSTGRES_*` variables or
+`DATABASE_URL` are read by Django; deprecated names raise a configuration
+error instead of silently switching databases.
 
 ```env
-# optional; leave unset for ./db.sqlite3 during local development
-SQLITE_DATABASE_PATH=/var/lib/cubixgear/db.sqlite3
+DB_ENGINE=django.db.backends.postgresql
+DB_NAME=cubixgear_db
+DB_USER=cubixgear_user
+DB_PASSWORD=
+DB_HOST=localhost
+DB_PORT=5432
+DB_CONN_MAX_AGE=0
 ```
 
-Use `python manage.py migrate` to create/update tables. Do not add `db.sqlite3` to Git; it is ignored.
+Fill the password in your **private** `.env`, not the committed example.
+Create the PostgreSQL database and role first, then run
+`python manage.py check` and `python manage.py migrate`. The local database
+server must be running. Production uses the same format with `DB_HOST`
+pointing at its database service or external provider.
 
-For a live business backend, use a **single Django application instance** on a server that has durable writable storage (for example, a VPS with a persistent disk). Mount the database path outside the deployment source tree and schedule safe SQLite backups, including restore tests. SQLite permits many readers but only one writer at a time; it is not a replacement for a distributed database with many concurrent workers.
+- `.env.example`: local DB_* + Redis values.
+- `.env.production.example` / `ENV.production.example.txt`: private production
+  settings with DB_* placeholders and no real credentials.
+- `compose.production.yml`: PostgreSQL, Redis, Django Gunicorn, Celery worker
+  and optional one Beat. The official PostgreSQL container internally maps
+  DB_* to the image-required POSTGRES_* variables.
+- `scripts/check_production_config.py`: read-only security/database/Redis preflight.
 
-**Vercel Functions cannot persist a live SQLite database.** Keep the React/Vite frontend on Vercel, but host Django on a VPS or another service with a persistent volume. Deployment with `VERCEL=1` and `DJANGO_DEBUG=False` intentionally fails rather than risking data loss.
+Local/CI SQLite remains available **only when explicitly configured** with
+`DB_ENGINE=django.db.backends.sqlite3` and `DB_NAME` pointing to a database
+file; production rejects SQLite. No automatic SQLite fallback exists.
+Changing database settings does **not** migrate existing workshop records.
+Back up and reconcile jobs, invoices, supplier credits, customer balances,
+payroll, inventory and ledger before switching a database. See
+[separate-service deployment guide](docs/production-postgres-celery.md).
+
+The React/Vite frontend stays separate (for example on Vercel) and uses
+`VITE_API_URL=https://YOUR_BACKEND/api/v1`; no database credentials
+belong in the frontend environment.
 
 ## Security notes
 

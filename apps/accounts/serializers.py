@@ -33,11 +33,23 @@ class UserSerializer(serializers.ModelSerializer):
     role = RoleMiniSerializer(read_only=True)
     isCompanyOwner = serializers.SerializerMethodField()
     paidAccessRequired = serializers.SerializerMethodField()
+    onboardingRequired = serializers.SerializerMethodField()
     effectivePermissions = serializers.SerializerMethodField()
 
     def get_isCompanyOwner(self, obj):
         from .permissions import is_company_owner
         return is_company_owner(obj)
+
+    def get_onboardingRequired(self, obj):
+        # Legacy tenants have no wizard state: never force a migration-time
+        # redirect or block existing owner logins.
+        if not obj.company_id or obj.company.owner_id != obj.pk:
+            return False
+        from apps.saas.models import CompanySetting
+        state = CompanySetting.objects.filter(
+            company_id=obj.company_id, category="onboarding",
+        ).values_list("data", flat=True).first() or {}
+        return bool(state.get("required") and not state.get("completed"))
 
     def get_paidAccessRequired(self, obj):
         return bool(obj.company_id and obj.company.require_paid_features)
@@ -72,7 +84,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "email", "phone", "normalized_phone", "avatar",
             "company", "branch", "role",
-            "employeeProfileId", "employeeDisplayNo", "effectivePermissions", "isCompanyOwner", "paidAccessRequired",
+            "employeeProfileId", "employeeDisplayNo", "effectivePermissions", "isCompanyOwner", "paidAccessRequired", "onboardingRequired",
             "is_staff", "is_superuser", "email_verified",
             "created_at",
         ]
@@ -81,6 +93,10 @@ class UserSerializer(serializers.ModelSerializer):
 def user_can_sign_in(user, *, allow_pending_setup=False):
     """All login methods must enforce the same active tenant and role checks."""
     if not user or not user.is_active:
+        return False
+    # Pending password setup is not a valid API session, even for legacy
+    # workshop records with no Employee profile.
+    if not allow_pending_setup and not user.has_usable_password():
         return False
     if not user.company_id:
         return True
@@ -119,9 +135,18 @@ class LoginSerializer(serializers.Serializer):
         if not ident:
             raise serializers.ValidationError({"identifier":"Enter your email or mobile number."})
         if "@" in ident:
+            # Legacy email identifiers can contain mixed-case local parts.
+            # Authenticate using the stored identifier, but never guess
+            # between different users whose emails differ only by case.
+            email_matches = list(
+                User.objects.filter(email__iexact=ident)
+                .values_list("email", flat=True)[:2]
+            )
+            if len(email_matches) != 1:
+                raise serializers.ValidationError(generic)
             user = authenticate(
                 request=self.context.get("request"),
-                email=ident.lower(), password=password,
+                email=email_matches[0], password=password,
             )
             if not user or not user_can_sign_in(user):
                 raise serializers.ValidationError(generic)
@@ -229,10 +254,24 @@ class PublicWorkshopSignupSerializer(serializers.Serializer):
     mobile = serializers.CharField(max_length=30)
     email = serializers.EmailField(required=False, allow_blank=True)
     whatsapp_consent = serializers.BooleanField(required=False, default=False)
+    # An owner can securely choose a password at registration without waiting
+    # for a WhatsApp or email delivery channel. Legacy invitation signup remains.
+    password = serializers.CharField(required=False, write_only=True, trim_whitespace=False, max_length=128)
+    confirm_password = serializers.CharField(required=False, write_only=True, trim_whitespace=False, max_length=128)
 
     def validate(self, attrs):
-        if not attrs.get('email') and not attrs.get('whatsapp_consent'):
-            raise serializers.ValidationError({'whatsapp_consent': 'Agree to receive the password setup link through official WhatsApp, or supply an email.'})
+        password = attrs.get("password")
+        confirmation = attrs.pop("confirm_password", None)
+        if password:
+            if password != confirmation:
+                raise serializers.ValidationError({"confirm_password": "Passwords do not match."})
+            validate_password(password)
+        elif confirmation:
+            raise serializers.ValidationError({"password": "Enter a password."})
+        elif not attrs.get("email") and not attrs.get("whatsapp_consent"):
+            raise serializers.ValidationError({
+                "password": "Create a password or choose an authorized password invitation channel."
+            })
         return attrs
 
     def validate_mobile(self, value):

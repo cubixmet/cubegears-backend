@@ -1,0 +1,117 @@
+# CubeGears PRODUCTION SERVICES — Docker Compose v2.
+# Copy .env.production.example to private .env; fill all empty secrets first.
+# HTTPS reverse proxy must forward api.example.com to 127.0.0.1:8000.
+# Do NOT put production database secrets inside this YAML.
+# The official PostgreSQL image requires internal POSTGRES_* names, mapped here
+# exclusively from the application-facing DB_* environment variables.
+name: cubegears
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:?Set DB_NAME in .env}
+      POSTGRES_USER: ${DB_USER:?Set DB_USER in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # Do not publish production Postgres port.
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command: ["sh", "-ec", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # Redis is private; do not publish 6379.
+
+  django-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cubegears-backend:production
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_ROLE: web
+    command:
+      - gunicorn
+      - config.wsgi:application
+      - --bind
+      - 0.0.0.0:8000
+      - --workers
+      - "3"
+      - --timeout
+      - "120"
+      - --access-logfile
+      - "-"
+      - --error-logfile
+      - "-"
+    ports:
+      - "127.0.0.1:8000:8000"
+    # Actual Django + PostgreSQL readiness: liveness alone is insufficient.
+    # Only internal loopback access is used and no credentials are exposed.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready/', timeout=3).read()"]
+      interval: 15s
+      timeout: 6s
+      start_period: 45s
+      retries: 5
+    volumes:
+      - media:/var/lib/cubegears/media
+      - private-job-media:/var/lib/cubegears/private_job_media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery-worker:
+    image: cubegears-backend:production
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_ROLE: worker
+    command: ["celery", "-A", "config", "worker", "--loglevel=INFO", "--concurrency=2"]
+    volumes:
+      - media:/var/lib/cubegears/media
+      - private-job-media:/var/lib/cubegears/private_job_media
+    depends_on:
+      django-web:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  celery-beat:
+    # Start only when scheduling has been reviewed. RUN ONLY ONE BEAT.
+    profiles: ["scheduler"]
+    image: cubegears-backend:production
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SERVICE_ROLE: beat
+    command: ["celery", "-A", "config", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+    depends_on:
+      django-web:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  media:
+  private-job-media:

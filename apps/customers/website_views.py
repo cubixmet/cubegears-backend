@@ -12,6 +12,8 @@ import time
 from mimetypes import guess_type
 
 from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
 from django.http import FileResponse, Http404
 from django.shortcuts import get_object_or_404
 from django.utils.decorators import method_decorator
@@ -21,12 +23,18 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 
-from apps.companies.models import Company, CompanyDomain, CompanyWebsiteSettings
+from apps.companies.models import Company, CompanyDomain, CompanyWebsiteSettings, CompanyWebsiteSubdomain
 from apps.customers.models import CustomerPortalAccess
 from apps.customers.portal_tokens import resolve_link
+from apps.customers.estimate_review import public_estimate
+from apps.customers.estimate_feedback import (
+    public_decline_feedback, validated_estimate_feedback,
+)
 from apps.customers.portal_views import _job_public
 from apps.invoices.models import Invoice
-from apps.jobs.models import Job, JobEstimate
+from apps.jobs.models import Job, JobActivity, JobEstimate
+from apps.jobs.workflow import workflow_state
+from apps.notifications.estimate_responses import notify_customer_estimate_response
 from apps.vehicles.models import VehicleInspectionPhoto
 from apps.vehicles.photo_views import _file_response
 
@@ -59,10 +67,23 @@ def _tenant(request):
         if slug:
             return get_object_or_404(Company, slug=slug, is_active=True)
     root = os.environ.get("CUSTOMER_PORTAL_ROOT_DOMAIN", "cubegears.com").lower().strip(".")
+    if settings.DEBUG and hostname.endswith(".localhost"):
+        root = "localhost"
     if hostname.endswith("." + root):
-        slug = hostname[:-(len(root) + 1)]
-        if re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", slug):
-            return get_object_or_404(Company, slug=slug, is_active=True)
+        label = hostname[:-(len(root) + 1)]
+        if re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?", label):
+            entry = CompanyWebsiteSubdomain.objects.select_related("company").filter(
+                label=label, company__is_active=True
+            ).first()
+            if entry:
+                return entry.company
+            # Legacy test/admin-created companies may not yet have a registry
+            # row. Never fall back to the login slug of a renamed website.
+            fallback = Company.objects.filter(
+                slug=label, is_active=True, website_subdomain__isnull=True
+            ).first()
+            if fallback:
+                return fallback
     domain = CompanyDomain.objects.select_related("company").filter(
         hostname=hostname, status=CompanyDomain.ACTIVE,
         is_approved=True, dns_configured=True, ownership_verified=True,
@@ -150,15 +171,64 @@ def _branding(company):
     }
 
 
+def _customer_quote(estimate, history=None):
+    result = public_estimate(estimate)
+    # Resolve historical version decisions from immutable audit records, not
+    # the latest-only workflow_progress pointer.
+    record = (history or {}).get(str(estimate.pk))
+    if record:
+        result["decisionReceipt"] = record
+        return result
+    # Compatibility for older decisions whose history has no receipt record.
+    progress = (estimate.job.workflow_progress or {}).get("customerEstimateDecision") or {}
+    if progress.get("estimateId") == str(estimate.pk) and progress.get("version") == estimate.version:
+        if progress.get("status") in {"Accepted", "Declined"}:
+            receipt = {
+                "id": progress.get("receiptId") or None,
+                "status": progress["status"],
+                "respondedAt": progress.get("respondedAt"),
+            }
+            if progress["status"] == "Declined":
+                receipt["declineFeedback"] = public_decline_feedback(progress)
+            result["decisionReceipt"] = receipt
+    return result
+
+
 def _dashboard(access):
     company, customer = access.company, access.customer
     vehicles = list(customer.vehicles.filter(company=company).order_by("registration")[:100])
     jobs = list(Job.objects.filter(
         company=company, customer=customer, vehicle__customer=customer
     ).select_related("vehicle").order_by("-created_at")[:100])
-    estimates = JobEstimate.objects.filter(
-        company=company, job__customer=customer, job__company=company, status="Approved"
-    ).order_by("-created_at")[:100]
+    estimates = list(JobEstimate.objects.filter(
+        company=company, job__customer=customer, job__company=company,
+        job__vehicle__customer=customer,
+        status__in=["Awaiting Customer", "Customer Approved", "Customer Rejected", "Approved"]
+    ).select_related("job").order_by("-created_at")[:100])
+    quote_ids = {str(e.pk) for e in estimates}
+    receipts = {}
+    if quote_ids:
+        # Bounded to this customer's own Job Cards and listed quote versions.
+        activities = JobActivity.objects.filter(
+            company=company, job__company=company, job__customer=customer,
+            job__vehicle__customer=customer,
+            job_id__in={e.job_id for e in estimates},
+            event__in=["Customer Estimate Accepted", "Customer Estimate Declined"],
+        ).order_by("created_at")
+        for activity in activities:
+            detail = activity.metadata or {}
+            estimate_key = str(detail.get("estimateId") or "")
+            if estimate_key not in quote_ids:
+                continue
+            declined = activity.event == "Customer Estimate Declined"
+            receipt = {
+                "id": str(activity.pk),
+                "status": "Declined" if declined else "Accepted",
+                "respondedAt": activity.created_at.isoformat(),
+            }
+            if declined:
+                receipt["declineFeedback"] = public_decline_feedback(detail)
+            receipts[estimate_key] = receipt
     invoices = Invoice.objects.filter(
         company=company, customer=customer, finalized_at__isnull=False
     ).exclude(status__in=["Draft", "Cancelled"]).order_by("-date")[:100]
@@ -173,10 +243,7 @@ def _dashboard(access):
             for v in vehicles
         ],
         "jobs": [_job_public(j) for j in jobs],
-        "estimates": [
-            {"jobId": str(e.job_id), "version": e.version,
-             "status": e.status, "total": str(e.total)} for e in estimates
-        ],
+        "estimates": [_customer_quote(e, receipts) for e in estimates],
         "invoices": [
             {"jobId": str(inv.job_id) if inv.job_id else None,
              "number": inv.number, "date": inv.date, "status": inv.status,
@@ -252,6 +319,130 @@ class WebsiteLogoutView(PortalBaseView):
             return _no_store(Response({"message": "Invalid request token."}, status=403))
         request.session.flush()
         return _no_store(Response({"authenticated": False}))
+
+
+class WebsiteEstimateDecisionView(PortalBaseView):
+    """Customer's explicit response to one staff-published immutable quote.
+
+    This records customer intent and an audit event. It never charges money,
+    advances the Job Card, issues inventory or finalizes an invoice.
+    """
+    @transaction.atomic
+    def post(self, request, estimate_id):
+        company = _tenant(request)
+        if not _verify_csrf(request):
+            return _no_store(Response({"message": "Invalid request token."}, status=403))
+        access = _session_access(request, company)
+        if not access:
+            return _no_store(Response({"message": "Customer session required."}, status=401))
+        decision = request.data.get("decision")
+        if decision not in {"accept", "decline"}:
+            return _no_store(Response({"message": "Choose accept or decline."}, status=400))
+        feedback = validated_estimate_feedback(request.data, decision)
+
+        found = JobEstimate.objects.filter(
+            pk=estimate_id, company=company,
+            job__company=company, job__customer=access.customer,
+            job__vehicle__customer=access.customer,
+        ).values_list("job_id", flat=True).first()
+        if not found:
+            raise Http404("Estimate not found.")
+        # Lock the job first, like the workshop approval API, so competing
+        # staff/customer decisions cannot advance an outdated quote.
+        job = get_object_or_404(
+            Job.objects.select_for_update(), pk=found, company=company,
+            customer=access.customer, vehicle__customer=access.customer,
+        )
+        estimate = get_object_or_404(
+            JobEstimate.objects.select_for_update(),
+            pk=estimate_id, job=job, company=company,
+        )
+        latest = job.estimates.order_by("-version", "-created_at").first()
+        if not latest or latest.pk != estimate.pk or workflow_state(job)["current"] != "estimate":
+            return _no_store(Response({"message": "This quotation is no longer open."}, status=409))
+        if str(request.data.get("version")) != str(estimate.version):
+            return _no_store(Response({"message": "Quotation version changed. Refresh before responding."}, status=409))
+
+        review = public_estimate(estimate)
+        supplied_hash = str(request.data.get("reviewHash") or "")
+        if not review["reviewable"] or not review["reviewHash"] or not hmac.compare_digest(
+            supplied_hash, review["reviewHash"]
+        ):
+            return _no_store(Response({
+                "message": "Quotation breakdown is missing or has changed. Refresh and review before responding."
+            }, status=409))
+
+        target = "Customer Approved" if decision == "accept" else "Customer Rejected"
+        if estimate.status == target:
+            # Exact repeat is idempotent; altered notes/reason after submission
+            # must not silently change a permanent audit decision.
+            previous = (job.workflow_progress or {}).get("customerEstimateDecision") or {}
+            if decision == "decline" and (
+                previous.get("estimateId") == str(estimate.pk)
+                and (
+                    previous.get("declineReason", "unspecified") != feedback["reason"]
+                    or previous.get("declineNote", "") != feedback["note"]
+                )
+            ):
+                return _no_store(Response({"message": "This decision was already recorded with different feedback."}, status=409))
+            return _no_store(Response({
+                "id": str(estimate.pk), "version": estimate.version,
+                "status": estimate.status, "total": str(estimate.total),
+                "decisionReceipt": _customer_quote(estimate).get("decisionReceipt"),
+            }))
+        if estimate.status != "Awaiting Customer":
+            return _no_store(Response({"message": "This quote is not available for customer review."}, status=409))
+        if (job.inspection or {}).get("revisedAt"):
+            from django.utils.dateparse import parse_datetime
+            revised = parse_datetime(job.inspection["revisedAt"])
+            if revised and estimate.created_at < revised:
+                return _no_store(Response({"message": "Inspection changed. Ask for a revised estimate."}, status=409))
+
+        estimate.status = target
+        estimate.save(update_fields=["status", "updated_at"])
+        now = timezone.now().isoformat()
+        activity = JobActivity.objects.create(
+            company=company, branch=job.branch, job=job, actor=None,
+            event="Customer Estimate Accepted" if decision == "accept" else "Customer Estimate Declined",
+            description=f"Customer responded to estimate V{estimate.version} via secure portal",
+            metadata={
+                "estimateId": str(estimate.pk), "version": estimate.version,
+                "total": str(estimate.total), "source": "customer_portal_session",
+                "reviewHash": review["reviewHash"],
+                **({
+                    "declineReason": feedback["reason"],
+                    "declineNote": feedback["note"],
+                } if feedback else {}),
+            },
+        )
+        progress = dict(job.workflow_progress or {})
+        progress["customerEstimateDecision"] = {
+            "status": "Accepted" if decision == "accept" else "Declined",
+            "estimateId": str(estimate.pk), "version": estimate.version,
+            "total": str(estimate.total), "respondedAt": now,
+            "receiptId": str(activity.pk), "reviewHash": review["reviewHash"],
+            "confirmationSource": "customer_portal_session",
+            **({
+                "declineReason": feedback["reason"],
+                "declineNote": feedback["note"],
+            } if feedback else {}),
+        }
+        job.workflow_progress = progress
+        job.save(update_fields=["workflow_progress", "updated_at"])
+        # Keep this inside the same transaction as the customer decision.
+        # Per-recipient inbox alerts are emitted only after a successful
+        # first response; an idempotent retry returns above without repeats.
+        notify_customer_estimate_response(job, estimate, decision, activity)
+        return _no_store(Response({
+            "id": str(estimate.pk), "version": estimate.version,
+            "status": estimate.status, "total": str(estimate.total),
+            "decisionReceipt": {
+                "id": str(activity.pk),
+                "status": "Accepted" if decision == "accept" else "Declined",
+                "respondedAt": now,
+                **({"declineFeedback": feedback} if feedback else {}),
+            },
+        }))
 
 
 class WebsiteLogoView(PortalBaseView):

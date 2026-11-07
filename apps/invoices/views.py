@@ -12,6 +12,7 @@ from .models import Invoice,EWayBill
 from apps.jobs.audit import record_job_event
 from .serializers import InvoiceSerializer,EWayBillSerializer
 from .gst_rate_options import gst_rate_options
+from .numbering import next_document_number
 
 class InvoiceViewSet(CompanyScopedModelViewSet):
     queryset=Invoice.objects.select_related("customer","vehicle","job").prefetch_related("items").all()
@@ -24,7 +25,30 @@ class InvoiceViewSet(CompanyScopedModelViewSet):
         "gst_context": "invoices.view",
         "preview": "invoices.view",
         "job_draft": "invoices.create",
+        "destroy": "invoices.edit",
     }
+
+    def destroy(self, request, *args, **kwargs):
+        # Even a cancelled draft is an audited, allocated invoice number.
+        # Never hard-delete documents referenced by GST/PDF/payment history.
+        self.get_object()
+        raise ValidationError({
+            "detail": "Invoices and estimates cannot be permanently deleted. Cancel an unissued draft instead."
+        })
+
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        # A concurrent finalize may not race an editing request and rewrite
+        # issued invoice lines after the official PDF has been frozen.
+        partial = kwargs.pop("partial", False)
+        scoped = self.get_object()
+        locked = Invoice.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        serializer = self.get_serializer(locked, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return response.Response(self.get_serializer(locked).data)
 
     @decorators.action(detail=False, methods=["get"], url_path="job-draft")
     def job_draft(self, request):
@@ -143,7 +167,10 @@ class InvoiceViewSet(CompanyScopedModelViewSet):
 
     @transaction.atomic
     def perform_create(self,serializer):
-        company=self.request.user.company
+        from apps.companies.models import Company
+        # Serialize document number allocation across all branches within
+        # the company; do not collide after cancelled documents or numbering gaps.
+        company=Company.objects.select_for_update().get(pk=self.request.user.company_id)
         kind=serializer.validated_data.get("kind","invoice")
         if kind == "invoice":
             # Lock the Job Card until the invoice is saved so concurrent retries
@@ -159,9 +186,11 @@ class InvoiceViewSet(CompanyScopedModelViewSet):
                     company=company, job=linked_job, kind="invoice",
                 ).exclude(status="Cancelled").exists():
                     raise ValidationError({"jobCardNo": "An active invoice already exists for this Job Card."})
-        count=Invoice.objects.filter(company=company,kind=kind).count()+1
-        prefix="EST" if kind=="estimate" else "INV"
-        number=serializer.validated_data.get("number") or f"{prefix}-{timezone.now().year}-{count:04d}"
+        number=serializer.validated_data.get("number") or next_document_number(company, kind)
+        if Invoice.objects.filter(company=company, number=number).exists():
+            raise ValidationError({
+                "number": "Document number is already in use in this workshop."
+            })
         obj=serializer.save(company=company,branch=self.request.user.branch,number=number)
         self._recalculate(obj)
         if obj.job_id:
@@ -196,8 +225,11 @@ class InvoiceViewSet(CompanyScopedModelViewSet):
     @transaction.atomic
     def finalize(self,request,pk=None):
         from apps.inventory.models import StockItem,StockMovement
-        obj=self.get_object()
+        scoped = self.get_object()
+        obj = Invoice.objects.select_for_update().get(pk=scoped.pk, company=scoped.company)
         if obj.status in {"Finalized","Paid","Issued","Converted"}: return response.Response(InvoiceSerializer(obj).data)
+        if obj.status != "Draft":
+            raise ValidationError({"status": "Only draft documents can be finalized."})
         if obj.kind=="invoice":
             # Only invoices that consume stock require the additional Stock permission.
             if obj.items.filter(stock_item__isnull=False).exists() and not user_has_permission(request.user, "stock.edit"):
@@ -233,18 +265,57 @@ class InvoiceViewSet(CompanyScopedModelViewSet):
         return response.Response(InvoiceSerializer(obj).data)
 
     @decorators.action(detail=True,methods=["post"])
-    def cancel(self,request,pk=None):
-        obj=self.get_object(); obj.status="Cancelled"; obj.cancelled_at=timezone.now(); obj.save(update_fields=["status","cancelled_at","updated_at"])
+    @transaction.atomic
+    def cancel(self, request, pk=None):
+        # Lock the record so a concurrent finalize or cancellation cannot
+        # bypass the state check or erase a document's legal audit trail.
+        scoped = self.get_object()
+        obj = Invoice.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        if obj.status == "Cancelled":
+            return response.Response(self.get_serializer(obj).data)
+        if obj.status != "Draft" or obj.finalized_at:
+            raise ValidationError({
+                "status": "Finalized or issued documents require a credit-note/reversal workflow."
+            })
+        if obj.payments.exists() or obj.converted_invoices.exists():
+            raise ValidationError({
+                "status": "Documents linked to payments or converted invoices cannot be cancelled."
+            })
+        reason = str(request.data.get("reason") or "").strip()
+        if not 5 <= len(reason) <= 500:
+            raise ValidationError({"reason": "Provide a cancellation reason (5–500 characters)."})
+        obj.status = "Cancelled"
+        obj.cancelled_at = timezone.now()
+        obj.cancellation_reason = reason
+        obj.save(update_fields=[
+            "status", "cancelled_at", "cancellation_reason", "updated_at",
+        ])
         if obj.job_id:
-            record_job_event(obj.job, request.user, "Invoice Cancelled",
-                             f"{obj.number} cancelled", {"invoiceId": str(obj.pk)})
-        return response.Response(InvoiceSerializer(obj).data)
+            record_job_event(
+                obj.job, request.user, "Invoice Cancelled",
+                f"{obj.number} cancelled", {
+                    "invoiceId": str(obj.pk), "reason": reason,
+                },
+            )
+        return response.Response(self.get_serializer(obj).data)
 
     @decorators.action(detail=True,methods=["post"],url_path="convert-to-invoice")
     @transaction.atomic
     def convert(self,request,pk=None):
-        src=self.get_object()
+        from apps.companies.models import Company
+        scoped = self.get_object()
+        company = Company.objects.select_for_update().get(pk=request.user.company_id)
+        src = Invoice.objects.select_for_update().get(pk=scoped.pk, company=company)
         if src.kind!="estimate": raise ValidationError("Only estimates can be converted.")
+        if src.status == "Converted":
+            existing = src.converted_invoices.filter(company=company).order_by("created_at").first()
+            if existing:
+                return response.Response(InvoiceSerializer(existing).data)
+            raise ValidationError({"status": "Converted estimate is missing its linked invoice. Contact support."})
+        if src.status not in {"Draft", "Issued"}:
+            raise ValidationError({"status": "Only draft or issued estimates can be converted."})
         if src.job_id:
             raise ValidationError({
                 "job": "A Job Card estimate is a quotation. Complete QC and prepare its invoice from actual billable work and issued parts."
@@ -253,7 +324,7 @@ class InvoiceViewSet(CompanyScopedModelViewSet):
             seller_snapshot=src.seller_snapshot, customer_snapshot=src.customer_snapshot,
             vehicle_snapshot=src.vehicle_snapshot,
             tax_mode=src.tax_mode,
-            number=f"INV-{timezone.now().year}-{Invoice.objects.filter(company=src.company,kind='invoice').count()+1:04d}",kind="invoice",invoice_type=src.invoice_type,status="Draft",date=timezone.localdate(),customer=src.customer,vehicle=src.vehicle,job=src.job,notes=src.notes,discount=src.discount,adjustment=src.adjustment,payment_mode=src.payment_mode,payment_terms=src.payment_terms,source_estimate=src)
+            number=next_document_number(company, "invoice"),kind="invoice",invoice_type=src.invoice_type,status="Draft",date=timezone.localdate(),customer=src.customer,vehicle=src.vehicle,job=src.job,notes=src.notes,discount=src.discount,adjustment=src.adjustment,payment_mode=src.payment_mode,payment_terms=src.payment_terms,source_estimate=src)
         for line in src.items.all():
             line.pk=None; line.invoice=invoice; line.save()
         # Converted estimates start as new draft invoices and use the active

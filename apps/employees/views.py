@@ -3,7 +3,7 @@ import re
 from django.db import transaction
 
 from apps.accounts.permissions import can_delegate
-from rest_framework import decorators, response
+from rest_framework import decorators, response, serializers
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
@@ -61,14 +61,73 @@ def _record_activity(employee, action, details="", actor=None, metadata=None):
     )
 
 
+class StaffBatchAssignmentSerializer(serializers.Serializer):
+    staffIds = serializers.ListField(
+        child=serializers.UUIDField(), allow_empty=True, max_length=500,
+    )
+
+    def validate_staffIds(self, values):
+        if len(values) != len(set(values)):
+            raise serializers.ValidationError("Select each staff member only once.")
+        return values
+
+
+def validated_assignment_staff(request, staff_ids, *, branch=None):
+    """Lock and validate the complete batch before changing any assignments."""
+    if not staff_ids:
+        return []
+    employees = list(
+        Employee.objects.select_for_update().filter(
+            company_id=request.user.company_id,
+            id__in=staff_ids,
+        ).order_by("pk")
+    )
+    if len(employees) != len(staff_ids):
+        raise ValidationError({"staffIds": "One or more staff members do not belong to this workshop."})
+    for employee in employees:
+        if employee.status not in {"Active", "Probation", "Notice Period"}:
+            raise ValidationError({"staffIds": f"{employee.name} must have active employment before assignment."})
+        if branch is not None and employee.branch_id != branch.pk:
+            raise ValidationError({"staffIds": f"{employee.name} belongs to a different branch."})
+    return employees
+
+
 class TeamViewSet(CompanyScopedModelViewSet):
     queryset=Team.objects.all()
     serializer_class=TeamSerializer
     permission_prefix="staff"
+    action_permission_map={"assign": "staff.edit"}
 
     def perform_create(self,serializer):
         branch=serializer.validated_data.get("branch",getattr(self.request.user,"branch",None))
         serializer.save(company=self.request.user.company,branch=branch)
+
+    @transaction.atomic
+    @decorators.action(detail=True, methods=["post"], url_path="assign")
+    def assign(self, request, pk=None):
+        """Assign multiple staff as one transaction instead of partial PATCH calls."""
+        team = self.get_object()
+        form = StaffBatchAssignmentSerializer(data=request.data)
+        form.is_valid(raise_exception=True)
+        employees = validated_assignment_staff(
+            request, form.validated_data["staffIds"], branch=team.branch,
+        )
+        for employee in employees:
+            if employee.team_id == team.pk:
+                continue
+            previous = employee.team.name if employee.team_id else "Unassigned"
+            employee.team = team
+            employee.department_name = team.name
+            employee.save(update_fields=["team", "department_name", "updated_at"])
+            _record_activity(
+                employee, "Team Assigned",
+                f"{previous} → {team.name}", request.user,
+                {"teamId": str(team.pk)},
+            )
+        return response.Response({
+            "teamId": str(team.pk),
+            "assignedStaffIds": [str(employee.pk) for employee in employees],
+        })
 
 
 class ShiftViewSet(CompanyScopedModelViewSet):
@@ -81,51 +140,48 @@ class ShiftViewSet(CompanyScopedModelViewSet):
         branch=serializer.validated_data.get("branch",getattr(self.request.user,"branch",None))
         serializer.save(company=self.request.user.company,branch=branch)
 
-    @decorators.action(detail=True,methods=["post"],url_path="assign")
-    def assign(self,request,pk=None):
-        shift=self.get_object()
-        staff_ids=[str(value) for value in (request.data.get("staffIds") or [])]
-        selected=Employee.objects.filter(
-            company=request.user.company,
-            id__in=staff_ids,
+    @transaction.atomic
+    @decorators.action(detail=True, methods=["post"], url_path="assign")
+    def assign(self, request, pk=None):
+        shift = self.get_object()
+        form = StaffBatchAssignmentSerializer(data=request.data)
+        form.is_valid(raise_exception=True)
+        staff_ids = form.validated_data["staffIds"]
+        selected = validated_assignment_staff(request, staff_ids, branch=shift.branch)
+        existing = list(
+            Employee.objects.select_for_update().filter(
+                company_id=request.user.company_id, shift=shift,
+            )
         )
-
-        removed=Employee.objects.filter(
-            company=request.user.company,
-            shift=shift,
-        ).exclude(id__in=staff_ids)
-
-        for employee in removed:
-            old_label=employee.shift_label or _shift_label(shift)
-            employee.shift=None
-            employee.shift_label=""
-            employee.save(update_fields=["shift","shift_label","updated_at"])
+        chosen = {employee.pk for employee in selected}
+        for employee in existing:
+            if employee.pk in chosen:
+                continue
+            old_label = employee.shift_label or _shift_label(shift)
+            employee.shift = None
+            employee.shift_label = ""
+            employee.save(update_fields=["shift", "shift_label", "updated_at"])
             _record_activity(
-                employee,
-                "Shift Removed",
-                old_label,
-                request.user,
-                {"shiftId":str(shift.id)},
+                employee, "Shift Removed", old_label, request.user,
+                {"shiftId": str(shift.pk)},
             )
-
         for employee in selected:
-            old_label=employee.shift_label or (
-                _shift_label(employee.shift) if employee.shift else "Unassigned"
+            if employee.shift_id == shift.pk and employee.shift_label == _shift_label(shift):
+                continue
+            old_label = employee.shift_label or (
+                _shift_label(employee.shift) if employee.shift_id else "Unassigned"
             )
-            employee.shift=shift
-            employee.shift_label=_shift_label(shift)
-            employee.save(update_fields=["shift","shift_label","updated_at"])
+            employee.shift = shift
+            employee.shift_label = _shift_label(shift)
+            employee.save(update_fields=["shift", "shift_label", "updated_at"])
             _record_activity(
-                employee,
-                "Shift Assigned",
-                f"{old_label} → {employee.shift_label}",
-                request.user,
-                {"shiftId":str(shift.id)},
+                employee, "Shift Assigned",
+                f"{old_label} → {employee.shift_label}", request.user,
+                {"shiftId": str(shift.pk)},
             )
-
         return response.Response({
-            "shift":self.get_serializer(shift).data,
-            "assignedStaffIds":[str(employee.id) for employee in selected],
+            "shift": self.get_serializer(shift).data,
+            "assignedStaffIds": [str(employee.pk) for employee in selected],
         })
 
 
@@ -186,14 +242,21 @@ class EmployeeViewSet(CompanyScopedModelViewSet):
         if not user.role_id or user.role.is_system or not user.role.is_active:
             raise ValidationError({"role": "A valid non-admin staff login role is required."})
         record = issue_invitation(user, issuer=self.request.user)
-        record.delivery_status = "manual"
-        record.save(update_fields=["delivery_status"])
+        from django.conf import settings
+        if getattr(settings, "STAFF_WHATSAPP_AUTO_SEND_ENABLED", False):
+            from apps.whatsapp.staff_invites import queue_staff_whatsapp_invitation
+            delivery = queue_staff_whatsapp_invitation(record, employee)
+        else:
+            delivery = "manual"
+            record.delivery_status = "manual"
+            record.save(update_fields=["delivery_status"])
         employee._setup_link = invitation_url(record)
-        employee._whatsapp_invite_status = "manual"
+        employee._whatsapp_invite_status = delivery
         _record_activity(
             employee, "Staff Password Invitation Created",
-            "A one-use, 24-hour setup link is ready for authorized manual sharing.",
+            "A one-use, 24-hour secure setup link was issued for authorized delivery.",
             self.request.user,
+            {"delivery": delivery},
         )
         return record
 
@@ -292,6 +355,15 @@ class EmployeeViewSet(CompanyScopedModelViewSet):
         selected_id = serializer.validated_data.pop("roleId", None)
         requested_name=serializer.validated_data.get("role_name")
         requested_email=serializer.validated_data.get("email")
+        requested_phone=serializer.validated_data.get("phone")
+        if instance.user and requested_phone is not None and requested_phone != (instance.user.normalized_phone or ""):
+            if not user_has_permission(self.request.user, "company.manage"):
+                raise PermissionDenied("Only the company owner can update a linked staff login mobile.")
+            from apps.accounts.models import User
+            if User.objects.filter(
+                company_id=instance.company_id, normalized_phone=requested_phone,
+            ).exclude(pk=instance.user_id).exists():
+                raise ValidationError({"phone": "This mobile already belongs to a login in this workshop."})
         if instance.user and requested_email is not None and requested_email.strip().lower() != (instance.user.email or '').lower():
             raise ValidationError({"email": "To change a linked login email, contact your company administrator."})
         if requested_name is not None and (requested_name != instance.role_name or (selected_id and instance.user and selected_id != instance.user.role_id)):
@@ -364,13 +436,37 @@ class EmployeeViewSet(CompanyScopedModelViewSet):
             if obj.user.name!=obj.name:
                 obj.user.name=obj.name
                 fields.append("name")
+            # Keep branch-scoped API access aligned with the staff profile.
+            if obj.user.branch_id != obj.branch_id:
+                obj.user.branch=obj.branch
+                fields.append("branch")
+            if requested_phone is not None and requested_phone != (obj.user.normalized_phone or ""):
+                obj.user.phone=requested_phone
+                obj.user.normalized_phone=requested_phone
+                fields.extend(["phone","normalized_phone"])
+                # Old unconsumed invitation links were issued for the old
+                # mobile number and must not remain usable after a change.
+                from django.utils import timezone
+                from apps.accounts.models import StaffPasswordInvitation
+                StaffPasswordInvitation.objects.filter(
+                    user=obj.user, used_at__isnull=True,
+                    invalidated_at__isnull=True,
+                ).update(
+                    invalidated_at=timezone.now(),
+                    delivery_status="superseded",
+                )
+                _record_activity(
+                    obj, "Staff Login Mobile Changed",
+                    "Staff login mobile updated; previous setup links revoked.",
+                    self.request.user,
+                )
             if "role_name" in serializer.validated_data:
                 role=self._resolve_role(obj.role_name, selected_id)
                 if obj.user.role_id != (role.pk if role else None):
                     obj.user.role=role
                     fields.append("role")
             if fields:
-                obj.user.save(update_fields=fields)
+                obj.user.save(update_fields=[*fields,"updated_at"])
 
         after={
             "role":obj.role_name,
@@ -493,7 +589,8 @@ class EmployeeViewSet(CompanyScopedModelViewSet):
                 raise ValidationError({"replace": "Provide a boolean replace value."})
             recent = StaffPasswordInvitation.objects.select_for_update().filter(
                 user=user, used_at__isnull=True, invalidated_at__isnull=True,
-                expires_at__gt=timezone.now(), delivery_status="manual",
+                expires_at__gt=timezone.now(),
+                delivery_status__in=["manual", "queued", "sending", "sent", "failed"],
             ).order_by("-created_at").first()
             cooldown = timedelta(seconds=60)
             should_reuse = bool(recent and (
@@ -509,9 +606,9 @@ class EmployeeViewSet(CompanyScopedModelViewSet):
                     raise ValidationError({"invite": "Too many replacement links. Try again later."})
                 invite = self._issue_staff_invitation(obj, user)
                 url = obj._setup_link
-            delivery = "manual"
+            delivery = invite.delivery_status
         return response.Response({
-            "message": "Manual setup link ready for sharing.",
+            "message": "Secure password setup link ready. WhatsApp status: " + delivery + ".",
             "setupLink": url, "expiresAt": invite.expires_at,
             "whatsappInviteStatus": delivery,
             "loginStatus": "Active" if user.has_usable_password() else "Pending Password Setup",
