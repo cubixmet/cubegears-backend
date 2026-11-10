@@ -52,8 +52,10 @@ class JobViewSet(CompanyScopedModelViewSet):
         "inspection_photo": "jobs.edit",
         "inspection_complete": "jobs.edit",
         "inspection_skip": "jobs.edit",
+        "inspection_reopen": "jobs.edit",
         "work_skip": "jobs.edit",
         "work_service_add": "jobs.edit",
+        "work_service_remove": "jobs.edit",
         "complaint_status": "jobs.edit",
         "inspection_add_to_estimate": "jobs.edit",
         "estimates": {"GET": "jobs.view", "POST": "jobs.edit"},
@@ -62,6 +64,7 @@ class JobViewSet(CompanyScopedModelViewSet):
         "estimate_decision": "jobs.edit",
         "estimate_share": "jobs.edit",
         "estimate_skip": "jobs.edit",
+        "estimate_reopen": "jobs.edit",
         "photos": {"GET": "jobs.view", "POST": "jobs.edit"},
         "upload_work_photo": "jobs.edit",
         "work_photo_file": "jobs.view",
@@ -904,6 +907,66 @@ class JobViewSet(CompanyScopedModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @decorators.action(
+        detail=True, methods=["delete"],
+        url_path=r"work/services/(?P<work_id>[^/.]+)",
+    )
+    @transaction.atomic
+    def work_service_remove(self, request, pk=None, work_id=None):
+        """Remove only a billable service entry in the active Work stage.
+
+        The customer selling charge disappears from the draft invoice suggestions,
+        but approved staff wages, issued parts and historical audit entries are
+        never deleted or modified by this operation.
+        """
+        from uuid import UUID
+        from apps.invoices.models import Invoice
+
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        if workflow_state(job)["current"] != "work":
+            raise ValidationError({"stage": "Services can only be removed during the Work stage."})
+        try:
+            normalized_id = str(UUID(str(work_id)))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({"workId": "Select a valid service entry."})
+        line = next(
+            (row for row in (job.work or []) if isinstance(row, dict)
+             and row.get("id") == normalized_id), None,
+        )
+        if not line or line.get("billable") is not True or not line.get("serviceId"):
+            raise ValidationError({"workId": "This saved service cannot be removed."})
+        if line.get("workerChargePosted") is True:
+            raise ValidationError({
+                "workId": "Worker charges are already posted; reverse them through the payroll workflow first."
+            })
+        if Invoice.objects.filter(company=job.company, job=job).exclude(
+            status="Cancelled"
+        ).exists():
+            raise ValidationError({
+                "workId": "An invoice already exists for this job; correct its billing before removing services."
+            })
+
+        job.work = [
+            row for row in (job.work or [])
+            if not (isinstance(row, dict) and row.get("id") == normalized_id)
+        ]
+        job.save(update_fields=["work", "updated_at"])
+        record_job_event(
+            job, request.user, "Job Service Removed",
+            f"Removed {line.get('service') or 'service'} from Work",
+            {
+                "workId": normalized_id,
+                "serviceId": line["serviceId"],
+                "quantity": line.get("quantity"),
+                "customerCharge": line.get("customerCharge"),
+                "agreedWorkerCharge": line.get("agreedWorkerCharge"),
+            },
+        )
+        return response.Response({"removedId": normalized_id, "job": JobSerializer(job).data})
+
     @decorators.action(detail=True, methods=["post"], url_path="work/skip")
     @transaction.atomic
     def work_skip(self, request, pk=None):
@@ -915,6 +978,7 @@ class JobViewSet(CompanyScopedModelViewSet):
         from apps.payroll.models import JobWorkSession
         from apps.inventory.models import StockMovement
         from .models import OutsideLabourCharge
+        from apps.invoices.models import Invoice
 
         scoped = self.get_object()
         job = Job.objects.select_for_update().get(pk=scoped.pk, company=scoped.company)
@@ -929,6 +993,7 @@ class JobViewSet(CompanyScopedModelViewSet):
             or JobWorkSession.objects.filter(company=job.company, job=job).exists()
             or OutsideLabourCharge.objects.filter(company=job.company, job=job).exists()
             or job.parts.filter(issued=True).exists()
+            or Invoice.objects.filter(company=job.company, job=job).exclude(status="Cancelled").exists()
             or job.photos.filter(photo_type="work_update").exists()
             or StockMovement.objects.filter(
                 company=job.company, job=job,
@@ -1273,6 +1338,70 @@ class JobViewSet(CompanyScopedModelViewSet):
             "job": JobSerializer(job).data,
         })
 
+    @decorators.action(detail=True, methods=["post"], url_path="inspection/reopen")
+    @transaction.atomic
+    def inspection_reopen(self, request, pk=None):
+        """Reopen a skipped inspection before downstream estimate approval/work.
+
+        The prior skip remains in JobActivity and a preserved skipHistory;
+        generic job updates cannot forge or undo the workflow transition.
+        """
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        data = dict(job.inspection or {})
+        if data.get("status") != "Skipped":
+            raise ValidationError({"inspection": "Only a skipped inspection can be reopened."})
+        state = workflow_state(job)
+        if state["current"] != "estimate" or (
+            (job.workflow_progress or {}).get("estimateDecision") or {}
+        ).get("status") == "Skipped":
+            raise ValidationError({
+                "inspection": "Reopen the skipped Estimate first, or finish the current stage before requesting changes."
+            })
+        if job.estimates.filter(
+            status__in=["Approved", "Awaiting Customer", "Customer Approved"],
+        ).exists():
+            raise ValidationError({
+                "inspection": "An approved or customer-shared estimate blocks reopening this inspection."
+            })
+        now = timezone.now().isoformat()
+        skip_receipt = {key: data.get(key) for key in (
+            "skipReason", "skippedAt", "skippedById", "skippedBy",
+        ) if data.get(key)}
+        history = list(data.get("skipHistory") or [])
+        history.append(skip_receipt)
+        for key in ("skipReason", "skippedAt", "skippedById", "skippedBy"):
+            data.pop(key, None)
+        data.update({
+            "status": "In Progress", "skipHistory": history,
+            "reopenedAt": now, "reopenedById": str(request.user.pk),
+            "revisedAt": now,
+        })
+        progress = dict(job.workflow_progress or {})
+        progress["completed"] = [stage for stage in STAGES
+                                  if stage in set(state["completed"]) and stage != "inspection"]
+        progress["skipped"] = [stage for stage in STAGES
+                                if stage in set(progress.get("skipped") or []) and stage != "inspection"]
+        details = dict(progress.get("skipDetails") or {})
+        details.pop("inspection", None)
+        progress["skipDetails"] = details
+        previous_status = job.status
+        job.inspection, job.workflow_progress = data, progress
+        job.status = Job.STATUS_INSPECTION
+        job.save(update_fields=["inspection", "workflow_progress", "status", "updated_at"])
+        record_job_event(
+            job, request.user, "Inspection Reopened",
+            "Previously skipped inspection reopened for corrections",
+            {"stage": "inspection", "previousSkip": skip_receipt,
+             "reopenedAt": now, "fromStatus": previous_status, "toStatus": job.status},
+        )
+        return response.Response({
+            "inspection": data, "workflow": workflow_state(job),
+            "job": JobSerializer(job).data,
+        })
+
     @decorators.action(detail=True,methods=["post"],url_path=r"inspection/findings/(?P<finding_id>[^/.]+)/add-to-estimate")
     def inspection_add_to_estimate(self,request,pk=None,finding_id=None):
         job=self.get_object()
@@ -1441,6 +1570,73 @@ class JobViewSet(CompanyScopedModelViewSet):
             job, request.user, "Estimate Skipped",
             f"Estimate skipped: {reason}",
             {**decision, "stage": "estimate"},
+        )
+        return response.Response({**workflow_state(job), "job": JobSerializer(job).data})
+
+    @decorators.action(detail=True, methods=["post"], url_path="estimate/reopen")
+    @transaction.atomic
+    def estimate_reopen(self, request, pk=None):
+        """Undo a skipped Estimate before any work/stock/payroll/billing activity."""
+        from apps.payroll.models import JobWorkSession
+        from apps.inventory.models import StockMovement
+        from .models import OutsideLabourCharge
+
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        progress = dict(job.workflow_progress or {})
+        decision = dict(progress.get("estimateDecision") or {})
+        if decision.get("status") != "Skipped":
+            raise ValidationError({"estimate": "Only a skipped Estimate can be reopened."})
+        if workflow_state(job)["current"] != "work":
+            raise ValidationError({
+                "estimate": "Estimate can only be reopened before Work advances to QC or billing."
+            })
+        if job.estimates.filter(
+            status__in=["Approved", "Awaiting Customer", "Customer Approved"],
+        ).exists():
+            raise ValidationError({"estimate": "An approved or shared estimate cannot be reopened."})
+        if (
+            job.work or job.work_updates or (job.qc or {}).get("status")
+            or JobWorkSession.objects.filter(company=job.company, job=job).exists()
+            or OutsideLabourCharge.objects.filter(company=job.company, job=job).exists()
+            or job.parts.filter(issued=True).exists()
+            or job.photos.filter(photo_type="work_update").exists()
+            or StockMovement.objects.filter(
+                company=job.company, job=job,
+                movement_type__in=("job_issue", "return"),
+            ).exists()
+            or any(
+                item.get("status", "Purchased") == "Purchased"
+                for item in (job.parts_workflow or {}).get("outsideParts", [])
+                if isinstance(item, dict)
+            )
+        ):
+            raise ValidationError({
+                "estimate": "Work, labour, stock or QC has already been recorded. Reopening would invalidate those records."
+            })
+        now = timezone.now().isoformat()
+        history = list(progress.get("estimateSkipHistory") or [])
+        history.append(decision)
+        progress["estimateSkipHistory"] = history
+        progress["estimateDecision"] = {"status": "Pending"}
+        progress["completed"] = [stage for stage in STAGES
+                                  if stage in set(workflow_state(job)["completed"]) and stage != "estimate"]
+        progress["skipped"] = [stage for stage in STAGES
+                                if stage in set(progress.get("skipped") or []) and stage != "estimate"]
+        details = dict(progress.get("skipDetails") or {})
+        details.pop("estimate", None)
+        progress["skipDetails"] = details
+        previous_status = job.status
+        job.workflow_progress = progress
+        job.status = Job.STATUS_ESTIMATE_PENDING
+        job.save(update_fields=["workflow_progress", "status", "updated_at"])
+        record_job_event(
+            job, request.user, "Estimate Reopened",
+            "Previously skipped estimate reopened for editing",
+            {"stage": "estimate", "previousSkip": decision,
+             "reopenedAt": now, "fromStatus": previous_status, "toStatus": job.status},
         )
         return response.Response({**workflow_state(job), "job": JobSerializer(job).data})
 
