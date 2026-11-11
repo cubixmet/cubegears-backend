@@ -210,7 +210,55 @@ class OutsidePartsView(APIView):
 
     def get(self, request, job_id):
         job = _job(request, job_id)
-        return Response({"items": _state(job).get("outsideParts", [])})
+        records = _state(job).get("outsideParts", [])
+        # Settlement balances are live Finance facts, not the snapshot from the
+        # original purchase. The same expense can be paid later or reversed.
+        from apps.accounts.permissions import user_has_permission
+        if not user_has_permission(request.user, "expenses.view"):
+            return Response({"items": records})
+        from uuid import UUID
+        from decimal import Decimal
+        from django.db.models import Sum
+        from apps.expenses.models import Expense, ExpenseSettlement
+        valid_ids = []
+        for row in records:
+            try:
+                if row.get("expenseId"):
+                    valid_ids.append(UUID(str(row["expenseId"])))
+            except (ValueError, TypeError, AttributeError):
+                pass
+        if not valid_ids:
+            return Response({"items": records})
+        expenses = {
+            str(row["id"]): row["amount"]
+            for row in Expense.objects.filter(
+                company=job.company, pk__in=valid_ids
+            ).values("id", "amount")
+        }
+        paid_totals = {
+            str(row["expense_id"]): row["total"] or Decimal("0.00")
+            for row in ExpenseSettlement.objects.filter(
+                company=job.company, expense_id__in=valid_ids,
+                reversed_at__isnull=True,
+            ).values("expense_id").annotate(total=Sum("amount"))
+        }
+        updated = []
+        for original in records:
+            row = dict(original)
+            expense_id = str(row.get("expenseId") or "")
+            if expense_id in expenses:
+                total = expenses[expense_id]
+                paid = min(total, paid_totals.get(expense_id, Decimal("0.00")))
+                balance = max(Decimal("0.00"), total - paid)
+                row.update({
+                    "paidAmount": str(paid),
+                    "balanceDue": str(balance),
+                    "paymentStatus": "Paid" if balance == 0 else (
+                        "Partially Paid" if paid > 0 else "Unpaid"
+                    ),
+                })
+            updated.append(row)
+        return Response({"items": updated})
 
     @transaction.atomic
     def post(self, request, job_id):
@@ -343,7 +391,7 @@ class OutsidePartCompleteView(APIView):
             qty = Decimal(str(record["quantity"]))
         except (InvalidOperation, ValueError, TypeError):
             raise ValidationError({"unitCost": "Enter a valid actual purchase rate."})
-        if not actual.is_finite() or actual < 0 or actual > Decimal("999999999.99"):
+        if not actual.is_finite() or actual <= 0 or actual > Decimal("999999999.99"):
             raise ValidationError({"unitCost": "Invalid purchase rate."})
         purchase_gst_rate = Decimal(str(record.get("purchaseGstRate") or 0))
         quote_base = (qty * Decimal(str(record["unitCost"]))).quantize(Decimal("0.01"))
@@ -355,28 +403,61 @@ class OutsidePartCompleteView(APIView):
             raise ValidationError({"unitCost": "Purchase amount exceeds the supported expense limit."})
         if actual_total > quoted_total:
             raise ValidationError({"unitCost": "Actual cost exceeds the approved quote. Request approval again."})
+        if actual_total <= 0:
+            raise ValidationError({"unitCost": "Actual purchase total must be positive."})
 
-        payment_type = str(request.data.get("paymentType") or "Credit").strip()
+        # A direct outside purchase is consumed by this Job Card, NOT added
+        # to inventory; its actual cost is an operating expense exactly once.
+        # Selling value goes to the customer invoice separately. No GST is
+        # assumed or fabricated for the outside purchase.
+        from apps.finance.views import account_balance
+        from django.shortcuts import get_object_or_404
+        payment_type = str(request.data.get("paymentType") or "").strip()
         if payment_type not in {"Cash", "Bank", "Credit"}:
             raise ValidationError({"paymentType": "Choose Cash, Bank or Credit."})
-        account = None
+        # Credit is zero paid. Cash and Bank can settle the bill in full or
+        # partially; the unpaid remainder stays as an Expense payable.
+        # Never make a second inventory movement or duplicate Supplier Bill.
+        raw_paid = request.data.get("paidAmount")
+        if payment_type == "Credit":
+            if raw_paid not in (None, "", "0", "0.0", "0.00"):
+                raise ValidationError({"paidAmount": "Credit purchases cannot pay money now."})
+            paid_now = Decimal("0.00")
+        else:
+            if raw_paid in (None, ""):
+                # Keep older Cash/Bank clients backwards-compatible.
+                paid_now = actual_total
+            else:
+                try:
+                    paid_now = Decimal(str(raw_paid))
+                except (InvalidOperation, ValueError, TypeError):
+                    raise ValidationError({"paidAmount": "Enter a valid amount to pay."})
+                if (not paid_now.is_finite() or paid_now.as_tuple().exponent < -2
+                        or paid_now <= 0 or paid_now > actual_total):
+                    raise ValidationError({
+                        "paidAmount": "Pay a positive amount, up to the full purchase total, with at most two decimals."
+                    })
+        balance_due = actual_total - paid_now
+        payment_account = None
         if payment_type != "Credit":
             if not (user_has_permission(request.user, "expenses.edit")
                     and user_has_permission(request.user, "payments.edit")):
                 raise ValidationError({"paymentType": "Expenses Edit and Payments Edit permissions are required to pay now."})
-            account_id = str(request.data.get("accountId") or "").strip()
+            account_id = request.data.get("accountId")
             if not account_id:
-                raise ValidationError({"accountId": "Select a cash or bank account to pay from."})
-            from django.shortcuts import get_object_or_404
-            account = get_object_or_404(
+                raise ValidationError({"accountId": "Select the Cash or Bank account used."})
+            payment_account = get_object_or_404(
                 WorkshopFinancialAccount.objects.select_for_update(),
-                pk=account_id, company=job.company, is_active=True,
+                company=job.company, pk=account_id, is_active=True,
             )
-            if account.kind != payment_type:
-                raise ValidationError({"accountId": f"Select a {payment_type.lower()} account."})
-            from apps.finance.views import account_balance
-            if account_balance(account) < actual_total:
-                raise ValidationError({"accountId": "Selected account has insufficient funds."})
+            kinds = {"Cash"} if payment_type == "Cash" else {"Bank", "UPI"}
+            if payment_account.kind not in kinds:
+                raise ValidationError({"accountId": "Selected account does not match payment type."})
+            if account_balance(payment_account) < paid_now:
+                raise ValidationError({"accountId": "Insufficient account balance."})
+        elif request.data.get("accountId"):
+            raise ValidationError({"accountId": "Credit purchases cannot select a paid account."})
+
         attached = OutsidePartBill(
             company=job.company, branch=job.branch, job=job,
             purchase_id=purchase_id, uploaded_by=request.user,
@@ -386,26 +467,37 @@ class OutsidePartCompleteView(APIView):
         try:
             attached.save()
             expense = Expense.objects.create(
-                company=job.company, branch=job.branch, date=timezone.localdate(),
-                category="Outside Job Purchase", vendor=record["vendor"][:180],
-                description=f"Job {job.job_number}: {record['partName']} x {qty}",
-                amount=actual_total, tax=gst_amount, reference=invoice,
-                payment_method=payment_type, status="Unpaid", created_by=request.user,
+                company=job.company, branch=job.branch,
+                date=timezone.localdate(), category="Outside Job Parts",
+                vendor=record["vendor"],
+                description=f"Direct job part: {record['partName']} × {qty} | Job {job.pk}",
+                amount=actual_total, tax=Decimal("0.00"), status="Unpaid",
+                reference=invoice, payment_method=payment_type,
+                created_by=request.user,
             )
-            if account is not None:
+            if payment_account:
+                # Reuse the existing finance settlement service. It records
+                # one atomic cash/bank debit and audited expense settlement.
                 ExpenseViewSet()._post_settlement(request, expense, {
-                    "amount": str(actual_total), "account": str(account.pk),
-                    "method": payment_type, "reference": invoice,
-                    "idempotencyKey": f"outside_part_{purchase_id}",
+                    "account": str(payment_account.pk),
+                    "amount": str(paid_now),
+                    "method": payment_type,
+                    "reference": invoice,
+                    "idempotencyKey": f"outside-job-part-{purchase_id}",
                 })
             record.update({
                 "status": "Purchased", "invoiceNo": invoice,
                 "unitCost": str(actual), "totalCost": str(actual_total),
                 "purchaseBase": str(actual_base), "purchaseGstAmount": str(gst_amount),
-                "paymentType": payment_type, "accountId": str(account.pk) if account else "",
-                "expenseId": str(expense.pk), "paymentStatus": "Paid" if account else "Unpaid",
+                "paymentType": payment_type,
+                "accountId": str(payment_account.pk) if payment_account else "",
+                "expenseId": str(expense.pk),
+                "paymentStatus": "Paid" if balance_due == 0 else
+                    ("Partially Paid" if paid_now > 0 else "Unpaid"),
                 "totalSelling": str((qty * Decimal(str(record["sellingPrice"]))).quantize(Decimal("0.01"))),
                 "billId": str(attached.id),
+                "paidAmount": str(paid_now),
+                "balanceDue": str(balance_due),
                 "usedAt": timezone.now().isoformat(), "purchasedBy": request.user.name,
             })
             _save(job, state)
