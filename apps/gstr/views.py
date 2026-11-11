@@ -1,18 +1,20 @@
 """GSTR APIs: preparation only, no portal filing or financial mutations."""
 import csv
+import hashlib
 import json
 import re
 from collections import Counter
 from datetime import datetime
 from decimal import Decimal
+from uuid import UUID
 
 from django.http import HttpResponse
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.permissions import RolePermission
+from apps.accounts.permissions import RolePermission, user_has_permission
 from .services import amount, money, parse_period, prepare
 
 
@@ -25,7 +27,10 @@ class GSTRReportView(APIView):
     permission_code = "gstr.view"
 
     def get(self, request, section="overview"):
-        data = prepare(request.user.company, _period(request))
+        data = prepare(
+            request.user.company, _period(request),
+            include_expense_review=user_has_permission(request.user, "expenses.view"),
+        )
         if section == "overview":
             return Response(data)
         if section == "gstr-1":
@@ -160,8 +165,40 @@ def _reconcile(books, statement):
 
 class GSTR2BReconcileView(APIView):
     permission_classes = [RolePermission]
-    permission_code = "gstr.reconcile"
+    # Reading previously saved matching evidence is read-only; uploading
+    # or saving new evidence requires the separate reconciliation permission.
+    permission_map = {"GET": ["gstr.view"], "POST": ["gstr.reconcile"]}
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def get(self, request):
+        """Reopen an audited, previously saved 2B reconciliation after refresh."""
+        from django.shortcuts import get_object_or_404
+        from .models import GSTR2BImport
+
+        selected = _period(request)
+        import_id = request.query_params.get("importId")
+        if not import_id:
+            raise ValidationError({"importId": "Select a saved GSTR-2B import."})
+        try:
+            import_uuid = UUID(str(import_id))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({"importId": "Invalid GSTR-2B import reference."})
+        batch = get_object_or_404(
+            GSTR2BImport, pk=import_uuid, company=request.user.company,
+            period=selected["period"],
+        )
+        rows = batch.rows if isinstance(batch.rows, list) else []
+        return Response({
+            "period": selected["period"], "importId": str(batch.pk),
+            "saved": True, "rows": rows,
+            "counts": dict(Counter(row.get("status", "Requires Review") for row in rows)),
+            "unsupportedSections": batch.unsupported_sections,
+            "importedAt": batch.created_at.isoformat(),
+            "notice": (
+                "Persisted matching evidence only. Supplier bills and cash "
+                "balances are unchanged; ITC needs separate review."
+            ),
+        })
 
     def post(self, request):
         period = _period(request)
@@ -173,20 +210,42 @@ class GSTR2BReconcileView(APIView):
             raise ValidationError({"file": "Select the official GSTR-2B JSON download."})
         if uploaded.size > 5 * 1024 * 1024:
             raise ValidationError({"file": "Maximum JSON upload size is 5 MB."})
+        raw = uploaded.read()
         try:
-            payload = json.loads(uploaded.read().decode("utf-8-sig"))
+            payload = json.loads(raw.decode("utf-8-sig"))
         except (ValueError, UnicodeError):
             raise ValidationError({"file": "Invalid UTF-8 JSON file."})
         statement, unsupported = _official_2b_rows(payload, company.gstin, period["period"])
         from .services import inward_rows
         books = inward_rows(company)[0]
         results = _reconcile(books, statement)
+        import_id = None
+        if request.query_params.get("save") == "1":
+            from django.db import transaction
+            from apps.companies.models import Company
+            from .models import GSTR2BImport
+            # A persisted match is only documentary evidence, never an ITC claim.
+            with transaction.atomic():
+                Company.objects.select_for_update().get(pk=company.pk)
+                saved, _ = GSTR2BImport.objects.get_or_create(
+                    company=company, period=period["period"],
+                    fingerprint=hashlib.sha256(raw).hexdigest(),
+                    defaults={
+                        "branch": request.user.branch, "rows": results,
+                        "unsupported_sections": unsupported,
+                        "imported_by": request.user,
+                    },
+                )
+                import_id = str(saved.pk)
         return Response({
             "period": period["period"], "rows": results,
+            "importId": import_id, "saved": bool(import_id),
             "counts": dict(Counter(r["status"] for r in results)),
             "unsupportedSections": unsupported,
-            "notice": ("Matching is read-only. This import is not retained. "
-                       "ITC eligibility, reverse charges and unmatched sections need independent review."),
+            "notice": (
+                "2B reconciliation results are saved as evidence only when Save is selected. "
+                "ITC eligibility requires a separate authorized review, including tax exclusions."
+            ),
         })
 
 
@@ -201,7 +260,10 @@ class GSTRCSVExportView(APIView):
     permission_code = "gstr.export"
 
     def get(self, request):
-        data = prepare(request.user.company, _period(request))
+        data = prepare(
+            request.user.company, _period(request),
+            include_expense_review=user_has_permission(request.user, "expenses.view"),
+        )
         report = request.query_params.get("report", "gstr1")
         if report == "gstr1":
             fields = ["number", "date", "customer", "customerGSTIN", "placeOfSupply",
@@ -211,8 +273,50 @@ class GSTRCSVExportView(APIView):
             fields = ["hsnSac", "description", "unit", "rate", "classification",
                       "quantity", "taxablePreview", "cgst", "sgst", "igst"]
             rows = data["hsn"]["rows"]
+        elif report == "purchases":
+            # Book purchase data only: this is NOT an official GSTR-2B export.
+            fields = ["number", "date", "supplier", "supplierGSTIN",
+                      "taxable", "tax", "cgst", "sgst", "igst",
+                      "taxVerified", "itcEligibility"]
+            rows = data["gstr2b"]["purchases"]
+        elif report == "expense-gst":
+            if not user_has_permission(request.user, "expenses.view"):
+                raise PermissionDenied("Expense access is required for this GST export.")
+            # Expense tax amounts have no validated GST-head split.
+            fields = ["date", "description", "category", "vendor",
+                      "reference", "amount", "tax", "status", "itcEligibility"]
+            rows = data["gstr2b"]["expenseGSTReview"]
+        elif report == "credits":
+            fields = ["number", "date", "invoiceNumber", "reason",
+                      "taxable", "cgst", "sgst", "igst", "total"]
+            rows = data["gstr1"]["creditNotes"]
+        elif report == "gstr3b":
+            fields = ["metric", "amount"]
+            rows = [
+                {"metric": key, "amount": value}
+                for key, value in data["gstr3b"].items()
+                if key in {
+                    "outwardTaxable", "outputCGST", "outputSGST",
+                    "outputIGST", "eligibleITC", "reversedITC",
+                    "indicativeGapBeforeUtilization",
+                }
+            ]
+        elif report == "itc":
+            from .models import GSTInputTaxClaim
+            fields = ["invoiceNumber", "period", "cgst", "sgst", "igst", "reason"]
+            claims = GSTInputTaxClaim.objects.filter(
+                company=request.user.company, period=data["period"],
+            ).select_related("bill")
+            rows = [{
+                "invoiceNumber": row.bill.invoice_number,
+                "period": row.period, "cgst": str(row.cgst),
+                "sgst": str(row.sgst), "igst": str(row.igst),
+                "reason": row.eligibility_reason,
+            } for row in claims]
         else:
-            raise ValidationError({"report": "Select gstr1 or hsn for preparation CSV export."})
+            raise ValidationError({
+                "report": "Select gstr1, gstr3b, credits, itc, hsn, purchases or expense-gst preparation CSV.",
+            })
         response = HttpResponse(content_type="text/csv; charset=utf-8")
         response["Content-Disposition"] = (
             f'attachment; filename="cubegears-{report}-{data["period"]}-PREPARATION.csv"')

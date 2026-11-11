@@ -1,5 +1,6 @@
 """Regression: OTP-free workshop/mobile login and one-use staff password invitations."""
 from datetime import timedelta
+from unittest.mock import patch
 from django.test import TestCase, override_settings
 from django.core.cache import cache
 from django.utils import timezone
@@ -81,10 +82,25 @@ class MobileStaffOnboardingTests(TestCase):
             "token":token, "password":"StrongPass23!","confirmPassword":"StrongPass23!",
         },format="json")
         self.assertEqual(consumed.status_code,200,consumed.data)
+        # First-time setup creates the same verified JWT session as normal
+        # mobile/password login, including staff without an email address.
+        self.assertTrue(consumed.data.get("access"))
+        self.assertTrue(consumed.data.get("refresh"))
+        self.assertEqual(consumed.data["user"]["id"], str(employee.user_id))
+        self.assertEqual(consumed.data["user"]["phone"], "+919333333333")
+        self.assertNotIn("password", consumed.data)
+        signed_in_client = APIClient()
+        signed_in_client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {consumed.data['access']}"
+        )
+        me = signed_in_client.get("/api/v1/auth/me")
+        self.assertEqual(me.status_code, 200, me.data)
         again = self.public.post("/api/v1/auth/staff-invitation/consume", {
             "token":token, "password":"StrongPass23!","confirmPassword":"StrongPass23!",
         },format="json")
         self.assertEqual(again.status_code,400)
+        self.assertNotIn("access", again.data)
+        self.assertNotIn("refresh", again.data)
         signed_in = self.public.post("/api/v1/auth/login", {
             "identifier":"+919333333333","password":"StrongPass23!",
         },format="json")
@@ -92,6 +108,33 @@ class MobileStaffOnboardingTests(TestCase):
         self.assertEqual(signed_in.data["user"]["id"],str(employee.user_id))
         self.assertFalse(signed_in.data["user"]["is_superuser"])
         self.assertIn("jobs.view",signed_in.data["user"]["effectivePermissions"])
+
+    def test_consume_does_not_issue_session_if_account_access_is_blocked(self):
+        from unittest.mock import patch
+
+        reply = self.create_staff()
+        token = reply.data["setupLink"].rsplit("/", 1)[-1]
+        # The invitation was authorized, but an account access check at the
+        # response boundary denies JWT issuance (e.g., role just revoked).
+        with patch("apps.accounts.views.user_can_sign_in", return_value=False):
+            consumed = self.public.post("/api/v1/auth/staff-invitation/consume", {
+                "token": token,
+                "password": "StrongPass23!",
+                "confirmPassword": "StrongPass23!",
+            }, format="json")
+        self.assertEqual(consumed.status_code, 200, consumed.data)
+        self.assertNotIn("access", consumed.data)
+        self.assertNotIn("refresh", consumed.data)
+        self.assertNotIn("user", consumed.data)
+        self.assertIn("cannot sign in", consumed.data["message"])
+        employee = Employee.objects.get(pk=reply.data["id"])
+        employee.user.refresh_from_db()
+        self.assertTrue(employee.user.check_password("StrongPass23!"))
+        self.assertEqual(self.public.post("/api/v1/auth/staff-invitation/consume", {
+            "token": token,
+            "password": "StrongPass23!",
+            "confirmPassword": "StrongPass23!",
+        }, format="json").status_code, 400)
 
     def test_resend_invalidates_old_link_and_expired_is_rejected(self):
         first = self.create_staff()
@@ -117,6 +160,72 @@ class MobileStaffOnboardingTests(TestCase):
         self.assertEqual(self.public.post("/api/v1/auth/staff-invitation/validate", {
             "token":new.data["setupLink"].rsplit("/",1)[-1],
         },format="json").status_code,400)
+
+    @override_settings(STAFF_WHATSAPP_AUTO_SEND_ENABLED=True)
+    def test_manual_whatsapp_reset_stays_manual_even_when_cloud_api_is_enabled(self):
+        created = self.create_staff(consent=True)
+        employee = Employee.objects.select_related("user").get(pk=created.data["id"])
+        employee.user.set_password("ExistingPassword33!")
+        employee.user.save(update_fields=["password"])
+        with patch("apps.whatsapp.staff_invites.queue_staff_whatsapp_invitation") as queue:
+            result = self.admin.post(
+                f"/api/v1/employees/{employee.pk}/invite",
+                {"manualOnly": True, "replace": True}, format="json",
+            )
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(result.data["purpose"], "reset")
+        self.assertEqual(result.data["whatsappInviteStatus"], "manual")
+        self.assertIn("/set-password/", result.data["setupLink"])
+        queue.assert_not_called()
+        self.assertEqual(
+            StaffPasswordInvitation.objects.filter(user=employee.user, invalidated_at__isnull=True).count(), 1
+        )
+        repeat = self.admin.post(
+            f"/api/v1/employees/{employee.pk}/invite",
+            {"manualOnly": True, "replace": True}, format="json",
+        )
+        self.assertEqual(repeat.status_code, 200, repeat.data)
+        self.assertEqual(repeat.data["setupLink"], result.data["setupLink"])
+
+    def test_manual_whatsapp_reset_requires_consent_and_boolean_mode(self):
+        created = self.create_staff(consent=False)
+        employee = Employee.objects.get(pk=created.data["id"])
+        for payload in ({"manualOnly": True}, {"manualOnly": "true"}):
+            result = self.admin.post(
+                f"/api/v1/employees/{employee.pk}/invite", payload, format="json",
+            )
+            self.assertEqual(result.status_code, 400, result.data)
+        self.assertEqual(
+            StaffPasswordInvitation.objects.filter(user=employee.user).count(), 1
+        )
+
+    @override_settings(STAFF_WHATSAPP_AUTO_SEND_ENABLED=True)
+    def test_manual_share_does_not_reuse_queued_auto_link(self):
+        created = self.create_staff(consent=True)
+        employee = Employee.objects.select_related("user").get(pk=created.data["id"])
+        recent = StaffPasswordInvitation.objects.filter(user=employee.user).latest("created_at")
+        recent.delivery_status = "queued"
+        recent.save(update_fields=["delivery_status"])
+        blocked = self.admin.post(
+            f"/api/v1/employees/{employee.pk}/invite",
+            {"manualOnly": True, "replace": True}, format="json",
+        )
+        self.assertEqual(blocked.status_code, 400, blocked.data)
+        self.assertIn("manualOnly", blocked.data)
+        # After the 60-second cooldown the server can rotate and invalidate
+        # the old queued link, instead of sharing one token through both modes.
+        StaffPasswordInvitation.objects.filter(pk=recent.pk).update(
+            created_at=timezone.now() - timedelta(seconds=70),
+        )
+        with patch("apps.whatsapp.staff_invites.queue_staff_whatsapp_invitation") as queue:
+            renewed = self.admin.post(
+                f"/api/v1/employees/{employee.pk}/invite",
+                {"manualOnly": True, "replace": True}, format="json",
+            )
+        self.assertEqual(renewed.status_code, 200, renewed.data)
+        self.assertEqual(renewed.data["whatsappInviteStatus"], "manual")
+        self.assertNotEqual(renewed.data["setupLink"], created.data["setupLink"])
+        queue.assert_not_called()
 
     def test_disable_login_does_not_disable_employment_or_payroll(self):
         reply = self.create_staff()
@@ -155,6 +264,20 @@ class MobileStaffOnboardingTests(TestCase):
         },format="json")
         self.assertEqual(resolved.status_code,200,resolved.data)
         self.assertEqual(resolved.data["user"]["id"],str(self.owner.pk))
+
+    def test_mixed_case_legacy_email_login_is_case_insensitive(self):
+        # UserManager normalizes only the domain and preserves the local part.
+        user = User.objects.create_user(
+            email="Legacy.Owner@Example.test", password="LegacyOwnerPass123!",
+            name="Legacy Case Owner", phone="+919111111191",
+            company=self.company, role=self.owner_role,
+        )
+        result = self.public.post("/api/v1/auth/login", {
+            "identifier": "legacy.owner@example.test",
+            "password": "LegacyOwnerPass123!",
+        }, format="json")
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(result.data["user"]["id"], str(user.pk))
 
     def test_email_and_mobile_platform_admin_still_work(self):
         platform = User.objects.create_superuser(

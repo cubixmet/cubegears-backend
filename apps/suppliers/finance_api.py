@@ -79,9 +79,11 @@ def bill_paid(bill):
 
 
 def bill_info(bill):
+    from .returns_api import bill_credit, bill_due
     paid = bill_paid(bill)
-    due = max(Decimal("0"), bill.total - paid) if bill.status == "Posted" else Decimal("0")
-    status = "Draft" if bill.status == "Draft" else "Paid" if due == 0 else "Partially Paid" if paid else "Unpaid"
+    credited = bill_credit(bill)
+    due = bill_due(bill)
+    status = "Draft" if bill.status == "Draft" else "Paid" if due == 0 else "Partially Paid" if paid or credited else "Unpaid"
     item_paid = {
         row["line_index"]: row["total"]
         for row in SupplierLinePaymentAllocation.objects.filter(
@@ -98,43 +100,64 @@ def bill_info(bill):
     return {
         **purchase_bill_components(bill.items, bill.tax),
         "id": str(bill.pk), "supplierId": str(bill.supplier_id),
+        "supplierName": bill.supplier.name,
+        "purchasedBy": bill.created_by.name if bill.created_by_id else "",
         "invoiceNumber": bill.invoice_number, "invoiceDate": bill.invoice_date.isoformat(),
         "dueDate": bill.due_date.isoformat() if bill.due_date else None,
         "relatedJobId": str(bill.related_job_id) if bill.related_job_id else None,
         "status": status, "postingStatus": bill.status, "items": items,
         "subtotal": str(bill.subtotal), "tax": str(bill.tax),
-        "total": str(bill.total), "paid": str(paid), "outstanding": str(due),
+        "total": str(bill.total.quantize(CENT)), "paid": str(paid.quantize(CENT)),
+        "creditsApplied": str(credited.quantize(CENT)),
+        "netPayable": str(max(Decimal("0"), bill.total - credited).quantize(CENT)),
+        "outstanding": str(due.quantize(CENT)),
         "receiveIntoStock": bill.receive_into_stock,
         "postedAt": bill.posted_at.isoformat() if bill.posted_at else None,
+        "createdAt": bill.created_at.isoformat(),
     }
 
 
 def supplier_summary(request, supplier):
-    bills = list(SupplierBill.objects.filter(company_id=request.user.company_id, supplier=supplier, status="Posted"))
-    amount_paid = Decimal("0")
-    total = Decimal("0")
-    outstanding = Decimal("0")
-    overdue = Decimal("0")
-    for bill in bills:
-        paid = bill_paid(bill)
-        remaining = max(Decimal("0"), bill.total - paid)
-        amount_paid += paid
-        total += bill.total
-        outstanding += remaining
-        if bill.due_date and bill.due_date < timezone.localdate():
-            overdue += remaining
-    advances = Decimal("0")
-    for payment in SupplierPayment.objects.filter(company_id=request.user.company_id, supplier=supplier, kind="Advance"):
-        applied = payment.allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0")
-        advances += max(Decimal("0"), payment.amount - applied)
+    from apps.inventory.models import SupplierDebitNote
+    from .returns_api import advance_available, bill_credit, bill_due, debit_available
+
+    bills = list(SupplierBill.objects.filter(
+        company_id=request.user.company_id, supplier=supplier, status="Posted",
+    ))
+    total = sum((bill.total for bill in bills), Decimal("0"))
+    amount_paid = sum((bill_paid(bill) for bill in bills), Decimal("0"))
+    credit_applied = sum((bill_credit(bill) for bill in bills), Decimal("0"))
+    outstanding = sum((bill_due(bill) for bill in bills), Decimal("0"))
+    overdue = sum((
+        bill_due(bill) for bill in bills
+        if bill.due_date and bill.due_date < timezone.localdate()
+    ), Decimal("0"))
+    advances = sum((
+        advance_available(payment)
+        for payment in SupplierPayment.objects.filter(
+            company_id=request.user.company_id, supplier=supplier, kind="Advance",
+        )
+    ), Decimal("0"))
+    notes = list(SupplierDebitNote.objects.filter(
+        company_id=request.user.company_id, supplier=supplier,
+    ))
+    note_credit = sum((debit_available(note) for note in notes), Decimal("0"))
     return {
         "supplierId": str(supplier.pk), "supplierName": supplier.name,
-        "totalPurchases": str(total.quantize(CENT)), "totalPaymentsApplied": str(amount_paid.quantize(CENT)),
-        "outstanding": str(outstanding.quantize(CENT)), "overdue": str(overdue.quantize(CENT)),
+        "totalPurchases": str(total.quantize(CENT)),
+        "totalPaymentsApplied": str(amount_paid.quantize(CENT)),
+        "creditsApplied": str(credit_applied.quantize(CENT)),
+        "totalReturns": str(sum((note.total for note in notes), Decimal("0")).quantize(CENT)),
+        "outstanding": str(outstanding.quantize(CENT)),
+        "overdue": str(overdue.quantize(CENT)),
         "availableAdvance": str(advances.quantize(CENT)),
         "totalUnappliedAdvances": str(advances.quantize(CENT)),
+        "availableDebitCredit": str(note_credit.quantize(CENT)),
+        "supplierRefundReceivable": str(note_credit.quantize(CENT)),
+        "netExposureAfterAvailableCredits": str(
+            (outstanding - advances - note_credit).quantize(CENT)
+        ),
     }
-
 
 def prepare_items(request, rows, receive_into_stock, tax_context=None):
     if not isinstance(rows, list) or not rows or len(rows) > 100:
@@ -151,7 +174,13 @@ def prepare_items(request, rows, receive_into_stock, tax_context=None):
         gst = money(row.get("gstRate", "0"), "gstRate")
         if gst > 100:
             raise ValidationError({"gstRate": "GST cannot exceed 100%."})
+        update_price = row.get("updateItemPrices") is True
+        selling_price = None
+        if update_price:
+            selling_price = money(row.get("sellingPrice"), "sellingPrice")
         item_id = row.get("itemId")
+        if update_price and not item_id:
+            raise ValidationError({"itemId": "Updating catalog prices requires a stock item."})
         item = None
         if item_id:
             item = get_object_or_404(StockItem, pk=item_id, company_id=request.user.company_id)
@@ -185,6 +214,8 @@ def prepare_items(request, rows, receive_into_stock, tax_context=None):
             "description": description, "partNumber": item.part_number if item else "",
             "sku": item.sku if item else "", "quantity": str(count),
             "purchaseRate": str(cost), "gstRate": str(gst),
+            "updateItemPrices": update_price,
+            **({"sellingPrice": str(selling_price)} if update_price else {}),
             "taxMode": context["taxMode"], "placeOfSupply": context["placeOfSupply"],
             "supplierStateCode": context["supplierStateCode"],
             "gstTreatment": components["gstTreatment"],
@@ -209,9 +240,12 @@ def record_supplier_payment(request, data):
     if kind not in {"Payment", "Advance"}:
         raise ValidationError({"kind": "Choose Payment or Advance."})
     method = str(data.get("method") or "").strip()
-    if method not in {"Cash", "Bank Transfer", "UPI"}:
-        raise ValidationError({"method": "Select Cash, Bank Transfer, or UPI."})
-    if {"Cash": "Cash", "Bank Transfer": "Bank", "UPI": "UPI"}[method] != account.kind:
+    if method not in {"Cash", "Bank", "Bank Transfer", "UPI"}:
+        raise ValidationError({"method": "Select Cash or Bank (legacy UPI/Bank Transfer accepted)."})
+    if method == "Bank":
+        from apps.finance.channels import validate_payment_channel
+        validate_payment_channel(method, account)
+    elif {"Cash": "Cash", "Bank Transfer": "Bank", "UPI": "UPI"}[method] != account.kind:
         raise ValidationError({"accountId": "Payment method does not match the account type."})
     key = str(data.get("idempotencyKey") or "").strip()
     if len(key) < 8 or len(key) > 120:
@@ -249,7 +283,8 @@ def record_supplier_payment(request, data):
         if bill.supplier_id != supplier.pk or bill.status != "Posted":
             raise ValidationError({"allocations": "Bill is not a posted bill for this supplier."})
         value = money(row.get("amount"), "amount", positive=True)
-        if value > bill.total - bill_paid(bill):
+        from .returns_api import bill_due
+        if value > bill_due(bill):
             raise ValidationError({"allocations": "Allocation exceeds the bill outstanding."})
         allocated += value
         line_rows = row.get("lineAllocations", [])
@@ -312,22 +347,49 @@ def record_supplier_payment(request, data):
 
 
 
-def finalize_supplier_bill(request, bill, payment_data=None):
+def finalize_supplier_bill(request, bill, payment_data=None, payments_data=None):
     """Post a bill, optional cash settlement and receipt in one DB transaction."""
     if bill.status != "Draft":
         raise ValidationError({"bill": "Supplier bill was already posted; inventory and liability were not posted again."})
     # Validate explicitly chosen components before changing any stock or ledger.
     validate_manual_purchase_lines(bill.items)
     if bill.receive_into_stock:
+        from apps.inventory.branch_stock import locked_branch_balance, move_balance
+        from apps.inventory.models import StockBranchBalance
         for row in bill.items:
             item = get_object_or_404(StockItem.objects.select_for_update(),
                 pk=row["itemId"], company_id=request.user.company_id)
-            if item.branch_id and item.branch_id != bill.branch_id:
-                raise ValidationError({"itemId": "Stock item branch no longer matches the purchase."})
+            receive_branch = bill.branch or request.user.branch
+            if item.branch_id and item.branch_id != getattr(receive_branch, "pk", None):
+                if not StockBranchBalance.objects.filter(
+                    company_id=request.user.company_id, item=item, branch=receive_branch,
+                ).exists():
+                    raise ValidationError({"itemId": "Transfer this item into the receiving branch first."})
             count = Decimal(row["quantity"])
             cost = Decimal(row["purchaseRate"])
+            balance = locked_branch_balance(item, receive_branch)
+            move_balance(balance, count)
             item.on_hand += count
-            item.save(update_fields=["on_hand", "updated_at"])
+            update_fields = ["on_hand", "updated_at"]
+            if item.supplier_id is None:
+                # Associate previously unassigned catalog products with the
+                # supplier when a real stock purchase is posted.
+                item.supplier_id = bill.supplier_id
+                update_fields.append("supplier")
+            if row.get("updateItemPrices") is True:
+                item.cost_price = cost
+                item.selling_price = Decimal(row["sellingPrice"])
+                item.tax = Decimal(row["gstRate"])
+                if item.tax == 0 and row.get("gstTreatment") in {
+                    "exempt", "nil_rated", "zero_rated", "non_gst",
+                }:
+                    item.gst_zero_classification = row["gstTreatment"]
+                elif item.tax > 0:
+                    item.gst_zero_classification = ""
+                update_fields.extend([
+                    "cost_price", "selling_price", "tax", "gst_zero_classification",
+                ])
+            item.save(update_fields=update_fields)
             StockMovement.objects.create(
                 company_id=request.user.company_id, branch=bill.branch,
                 item=item, movement_type="purchase", quantity=count,
@@ -340,6 +402,30 @@ def finalize_supplier_bill(request, bill, payment_data=None):
     bill.posted_at = timezone.now()
     bill.save(update_fields=["status", "posted_at", "updated_at"])
     result = bill_info(bill)
+    if payment_data is not None and payments_data is not None:
+        raise ValidationError({"payments": "Use payment or payments, not both."})
+    if payments_data is not None:
+        if not isinstance(payments_data, list) or not (1 <= len(payments_data) <= 5):
+            raise ValidationError({"payments": "Provide 1–5 cash/bank payment splits."})
+        if any(not isinstance(row, dict) for row in payments_data):
+            raise ValidationError({"payments": "Every split must be an object."})
+        total_split = sum(
+            (money(row.get("amount"), "amount", positive=True) for row in payments_data),
+            Decimal("0"),
+        )
+        if total_split > bill.total:
+            raise ValidationError({"payments": "Paid amounts exceed supplier bill total."})
+        posted = []
+        for row in payments_data:
+            if row.get("kind", "Payment") != "Payment" or "allocations" in row:
+                raise ValidationError({"payments": "Split payments must settle this bill, not advances or other bills."})
+            amount = money(row.get("amount"), "amount", positive=True)
+            payload = {
+                **row, "kind": "Payment", "supplierId": str(bill.supplier_id),
+                "allocations": [{"billId": str(bill.pk), "amount": str(amount)}],
+            }
+            posted.append(record_supplier_payment(request, payload))
+        return {**bill_info(bill), "payments": posted}
     if payment_data is not None:
         if not isinstance(payment_data, dict):
             raise ValidationError({"payment": "Payment must be a valid object."})
@@ -453,7 +539,7 @@ class SupplierBillCollection(APIView):
     permission_map = {"GET": ["stock.view", "payments.view"], "POST": ["stock.create", "payments.create"]}
 
     def get(self, request):
-        qs = SupplierBill.objects.filter(company_id=request.user.company_id).select_related("supplier").order_by("-created_at")
+        qs = SupplierBill.objects.filter(company_id=request.user.company_id).select_related("supplier", "created_by").order_by("-created_at")
         supplier_id = request.query_params.get("supplier")
         if supplier_id:
             supplier = supplier_for(request, supplier_id)
@@ -498,8 +584,9 @@ class SupplierBillCollection(APIView):
         if request.data.get("postNow") is True:
             return Response(finalize_supplier_bill(
                 request, bill, request.data.get("payment"),
+                request.data.get("payments"),
             ), status=201)
-        if request.data.get("payment") is not None:
+        if request.data.get("payment") is not None or request.data.get("payments") is not None:
             raise ValidationError({"payment": "Immediate payments require postNow=true."})
         return Response(bill_info(bill), status=201)
 
@@ -511,7 +598,7 @@ class SupplierBillPost(APIView):
     @transaction.atomic
     def post(self, request, pk):
         bill = bill_for(request, pk, lock=True)
-        return Response(finalize_supplier_bill(request, bill, request.data.get("payment")))
+        return Response(finalize_supplier_bill(request, bill, request.data.get("payment"), request.data.get("payments")))
 
 
 class SupplierPaymentCollection(APIView):
@@ -519,7 +606,8 @@ class SupplierPaymentCollection(APIView):
     permission_map = {"GET": ["stock.view", "payments.view"], "POST": ["stock.view", "payments.create"]}
 
     def get(self, request):
-        qs = SupplierPayment.objects.filter(company_id=request.user.company_id).select_related("supplier", "account")
+        from .returns_api import advance_available
+        qs = SupplierPayment.objects.filter(company_id=request.user.company_id).select_related("supplier", "account", "created_by").prefetch_related("allocations__bill")
         if request.query_params.get("supplier"):
             qs = qs.filter(supplier=supplier_for(request, request.query_params["supplier"]))
         result = []
@@ -527,10 +615,18 @@ class SupplierPaymentCollection(APIView):
             applied = payment.allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0")
             result.append({
                 "id": str(payment.pk), "supplierId": str(payment.supplier_id),
+                "supplierName": payment.supplier.name,
+                "createdAt": payment.created_at.isoformat(),
+                "recordedBy": payment.created_by.name if payment.created_by_id else "",
+                "billReferences": [allocation.bill.invoice_number for allocation in payment.allocations.all()],
                 "accountId": str(payment.account_id), "amount": str(payment.amount),
                 "kind": payment.kind, "method": payment.method,
                 "reference": payment.reference, "paidOn": payment.paid_on.isoformat(),
-                "applied": str(applied), "unapplied": str(payment.amount - applied),
+                "applied": str(applied),
+                "unapplied": str(
+                    advance_available(payment) if payment.kind == "Advance"
+                    else max(Decimal("0"), payment.amount - applied)
+                ),
             })
         return Response(result)
 
@@ -551,10 +647,10 @@ class SupplierAdvanceApply(APIView):
         if bill.supplier_id != payment.supplier_id or bill.status != "Posted":
             raise ValidationError({"billId": "Choose a posted bill for the same supplier."})
         amount = money(request.data.get("amount"), "amount", positive=True)
-        applied = payment.allocations.aggregate(total=Sum("amount"))["total"] or Decimal("0")
-        if amount > payment.amount - applied:
+        from .returns_api import advance_available, bill_due
+        if amount > advance_available(payment):
             raise ValidationError({"amount": "Not enough unapplied supplier advance."})
-        if amount > bill.total - bill_paid(bill):
+        if amount > bill_due(bill):
             raise ValidationError({"amount": "Amount exceeds the remaining supplier bill."})
         if SupplierPaymentAllocation.objects.filter(payment=payment, bill=bill).exists():
             raise ValidationError({"billId": "Advance already applied to this bill. Use another bill."})
@@ -564,8 +660,8 @@ class SupplierAdvanceApply(APIView):
         )
         return Response({
             "allocationId": str(allocation.pk), "applied": str(amount),
-            "billOutstanding": str(bill.total - bill_paid(bill)),
-            "advanceRemaining": str(payment.amount - applied - amount),
+            "billOutstanding": str(bill_due(bill)),
+            "advanceRemaining": str(advance_available(payment)),
             "note": "Advance applied without another cash/bank deduction.",
         }, status=201)
 
@@ -587,21 +683,85 @@ class SupplierLedger(APIView):
         events = []
         for bill in SupplierBill.objects.filter(company_id=request.user.company_id, supplier=supplier, status="Posted"):
             events.append({
-                "date": bill.posted_at.isoformat(),
+                "date": (bill.posted_at or bill.created_at).isoformat(),
                 "type": "Supplier Bill", "reference": bill.invoice_number,
                 "payableIncrease": bill.total, "payableDecrease": Decimal("0"),
                 "sourceId": str(bill.pk),
             })
+        # Advances move money when first paid, not again when later allocated.
+        # Those initial transactions otherwise disappear from the payable ledger.
+        for payment in SupplierPayment.objects.filter(
+            company_id=request.user.company_id, supplier=supplier, kind="Advance",
+        ).select_related("account"):
+            events.append({
+                "date": payment.created_at.isoformat(),
+                "type": "Supplier Advance",
+                "reference": payment.reference or f"Advance {str(payment.pk)[:8]}",
+                "payableIncrease": Decimal("0"), "payableDecrease": Decimal("0"),
+                "cashOut": str(payment.amount), "cashIn": "0.00",
+                "accountName": payment.account.name,
+                "method": payment.method, "paidOn": payment.paid_on.isoformat(),
+                "sourceId": str(payment.pk),
+            })
         allocations = SupplierPaymentAllocation.objects.filter(
             company_id=request.user.company_id, payment__supplier=supplier,
-        ).select_related("payment", "bill")
+        ).select_related("payment__account", "bill")
         for alloc in allocations:
+            is_advance = alloc.payment.kind == "Advance"
             events.append({
                 "date": alloc.created_at.isoformat(),
-                "type": "Advance Application" if alloc.payment.kind == "Advance" else "Supplier Payment",
+                "type": "Advance Application" if is_advance else "Supplier Payment",
                 "reference": alloc.bill.invoice_number,
+                "paymentReference": alloc.payment.reference,
                 "payableIncrease": Decimal("0"), "payableDecrease": alloc.amount,
+                # The original advance has its own cash event; allocation is
+                # an accounting transfer and must never debit the account twice.
+                "cashOut": "0.00" if is_advance else str(alloc.amount),
+                "cashIn": "0.00",
+                "accountName": alloc.payment.account.name,
+                "method": alloc.payment.method,
+                "paidOn": alloc.payment.paid_on.isoformat(),
                 "sourceId": str(alloc.payment_id),
+            })
+        from apps.inventory.models import (
+            SupplierDebitNote, SupplierDebitApplication, SupplierRefund,
+        )
+        for note in SupplierDebitNote.objects.filter(
+            company_id=request.user.company_id, supplier=supplier,
+        ):
+            events.append({
+                "date": note.created_at.isoformat(),
+                "type": "Purchase Return / Debit Note",
+                "reference": note.number,
+                "payableIncrease": Decimal("0"),
+                "payableDecrease": note.payable_reduction,
+                "sourceId": str(note.pk),
+            })
+        for application in SupplierDebitApplication.objects.filter(
+            company_id=request.user.company_id, debit_note__supplier=supplier,
+        ).select_related("bill"):
+            events.append({
+                "date": application.created_at.isoformat(),
+                "type": "Debit Credit Application",
+                "reference": application.bill.invoice_number,
+                "payableIncrease": Decimal("0"),
+                "payableDecrease": application.amount,
+                "sourceId": str(application.pk),
+            })
+        for refund in SupplierRefund.objects.filter(
+            company_id=request.user.company_id, supplier=supplier,
+        ).select_related("account"):
+            events.append({
+                "date": refund.created_at.isoformat(),
+                "type": "Supplier Refund",
+                "reference": refund.reference,
+                "payableIncrease": Decimal("0"),
+                "payableDecrease": Decimal("0"),
+                "cashIn": str(refund.amount),
+                "cashOut": "0.00",
+                "accountName": refund.account.name,
+                "method": refund.method,
+                "sourceId": str(refund.pk),
             })
         events.sort(key=lambda row: (row["date"], row["type"], row["sourceId"]))
         running = Decimal("0")
@@ -610,7 +770,10 @@ class SupplierLedger(APIView):
             event["payableIncrease"] = str(event["payableIncrease"])
             event["payableDecrease"] = str(event["payableDecrease"])
             event["runningPayable"] = str(running)
+            event.setdefault("cashIn", "0.00")
+            event.setdefault("cashOut", "0.00")
         result = supplier_summary(request, supplier)
         result["entries"] = events
-        result["signConvention"] = "Positive = supplier payable; advance is separate until applied."
+        result["transactionCount"] = len(events)
+        result["signConvention"] = "Positive = supplier payable; debit-note and advance credits remain separate until applied or refunded."
         return Response(result)

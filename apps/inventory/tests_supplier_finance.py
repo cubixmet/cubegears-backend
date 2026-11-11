@@ -88,6 +88,88 @@ class SupplierFinanceTests(TestCase):
         self.assertEqual(r.status_code, 200)
         return r.data[0]["recordedBalance"]
 
+    def test_supplier_directory_balances_include_more_than_first_hundred_posted_bills(self):
+        from datetime import date
+        from decimal import Decimal
+        from django.utils import timezone
+
+        SupplierBill.objects.bulk_create([
+            SupplierBill(
+                company=self.company, branch=self.branch, supplier=self.supplier,
+                invoice_number=f"LIST-{idx:04d}", invoice_date=date(2026, 11, 1),
+                due_date=date(2026, 11, 2),
+                items=[], subtotal=Decimal("10.00"), tax=Decimal("0.00"),
+                total=Decimal("10.00"), status="Posted", posted_at=timezone.now(),
+            )
+            for idx in range(105)
+        ])
+        SupplierBill.objects.create(
+            company=self.company, branch=self.branch, supplier=self.supplier,
+            invoice_number="DRAFT-LIST", invoice_date=date(2026, 11, 1),
+            total=Decimal("4000.00"), status="Draft",
+        )
+        directory = self.client.get(f"{self.base}/suppliers/balances")
+        self.assertEqual(directory.status_code, 200, getattr(directory, "data", None))
+        found = next(row for row in directory.data
+                     if row["supplierId"] == str(self.supplier.pk))
+        self.assertEqual(found["postedBillCount"], 105)
+        self.assertEqual(found["outstanding"], "1050.00")
+        self.assertEqual(found["overdue"], "1050.00")
+        self.assertEqual(found["totalPurchases"], "1050.00")
+        self.assertEqual(found["availableAdvance"], "0.00")
+        self.assertEqual(found["netExposureAfterAvailableCredits"], "1050.00")
+        self.assertEqual(found["outstanding"], self.summary()["outstanding"])
+
+    def test_supplier_ledger_shows_real_cash_and_credit_movements_once(self):
+        from decimal import Decimal
+        bill = self.create_bill("600.00")
+        self.assertEqual(self.post_bill(bill).status_code, 200)
+        payment = self.pay(
+            [{"billId": bill, "amount": "200.00"}],
+            amount="200.00", key="cash-flow-direct",
+        )
+        self.assertEqual(payment.status_code, 201)
+        advance = self.pay(amount="100.00", kind="Advance", key="cash-flow-advance")
+        self.assertEqual(advance.status_code, 201)
+        before = self.account_balance()
+        applied = self.client.post(
+            f"{self.base}/payments/{advance.data['id']}/allocate",
+            {"billId": bill, "amount": "100.00"}, format="json",
+        )
+        self.assertEqual(applied.status_code, 201, getattr(applied, "data", None))
+        self.assertEqual(self.account_balance(), before)
+
+        ledger = self.client.get(f"{self.base}/suppliers/{self.supplier.pk}/ledger")
+        self.assertEqual(ledger.status_code, 200, getattr(ledger, "data", None))
+        entries = ledger.data["entries"]
+        self.assertTrue(any(item["type"] == "Supplier Advance"
+                            and item["cashOut"] == "100.00" for item in entries))
+        self.assertTrue(any(item["type"] == "Advance Application"
+                            and item["cashOut"] == "0.00" for item in entries))
+        self.assertTrue(any(item["type"] == "Supplier Payment"
+                            and item["cashOut"] == "200.00" for item in entries))
+        self.assertEqual(
+            sum((Decimal(item["cashOut"]) for item in entries), Decimal("0.00")),
+            Decimal("300.00"),
+        )
+        self.assertEqual(ledger.data["outstanding"], "300.00")
+        self.assertEqual(Decimal(entries[-1]["runningPayable"]), Decimal("300.00"))
+
+    def test_directory_supplier_balance_requires_finance_permission(self):
+        role = Role.objects.create(
+            company=self.company, name="Stock Viewer", code="SUP_STOCK_ONLY",
+            permissions=["stock.view"], is_active=True,
+        )
+        staff = User.objects.create_user(
+            email="stock-only@example.test", name="Stock Viewer",
+            password="safe-password", company=self.company,
+            branch=self.branch, role=role,
+        )
+        self.client.force_authenticate(user=staff)
+        self.assertEqual(self.client.get(
+            f"{self.base}/suppliers/balances",
+        ).status_code, 403)
+
     def test_draft_creates_neither_payable_stock_movement_nor_bank_entry(self):
         bill = self.create_bill(total="2100.00", receive=True, sku_item=True)
         self.assertEqual(SupplierBill.objects.get(pk=bill).status, "Draft")
@@ -269,7 +351,7 @@ class SupplierFinanceTests(TestCase):
         }, format="json")
         self.assertEqual(posted.status_code, 201, getattr(posted, "data", None))
         self.assertEqual(posted.data["postingStatus"], "Posted")
-        self.assertEqual(posted.data["outstanding"], "0")
+        self.assertEqual(posted.data["outstanding"], "0.00")
         self.assertEqual(self.summary()["outstanding"], "0.00")
         self.assertEqual(self.account_balance(), "18000.00")
         self.stock.refresh_from_db()
@@ -419,3 +501,134 @@ class SupplierFinanceTests(TestCase):
         self.assertEqual(valid.status_code, 201, getattr(valid, "data", None))
         self.assertEqual(valid.data["taxMode"], "unregistered")
         self.assertEqual(valid.data["items"][0]["gstTreatment"], "unregistered")
+
+    def test_real_example_200_part_100_paid_then_multi_bill_settlement(self):
+        """₹200 purchase/₹100 payment leaves ₹100 due; later credit remains exact."""
+        part_bill = self.create_bill("200.00", receive=True, sku_item=True)
+        posted = self.post_bill(part_bill)
+        self.assertEqual(posted.status_code, 200, getattr(posted, "data", None))
+        self.assertEqual(self.summary()["outstanding"], "200.00")
+        self.assertEqual(self.account_balance(), "20000.00")  # credit is not cash movement
+        first = self.pay(
+            [{"billId": part_bill, "amount": "100.00"}],
+            amount="100.00", key="parts-one-hundred-now",
+        )
+        self.assertEqual(first.status_code, 201, getattr(first, "data", None))
+        self.assertEqual(self.summary()["outstanding"], "100.00")
+        self.assertEqual(self.account_balance(), "19900.00")
+
+        second_bill = self.create_bill("500.00")
+        self.assertEqual(self.post_bill(second_bill).status_code, 200)
+        self.assertEqual(self.summary()["outstanding"], "600.00")
+        settle = self.pay(
+            [
+                {"billId": part_bill, "amount": "100.00"},
+                {"billId": second_bill, "amount": "400.00"},
+            ],
+            amount="500.00", key="supplier-five-hundred-multiple-bills",
+        )
+        self.assertEqual(settle.status_code, 201, getattr(settle, "data", None))
+        self.assertEqual(self.summary()["outstanding"], "100.00")
+        self.assertEqual(self.account_balance(), "19400.00")
+        self.assertEqual(SupplierPayment.objects.count(), 2)
+        self.assertEqual(WorkshopAccountEntry.objects.count(), 2)
+
+        activity = self.client.get("/api/v1/finance/payment-activity?page_size=1000")
+        self.assertEqual(activity.status_code, 200, getattr(activity, "data", None))
+        supplier_rows = [row for row in activity.data["results"] if row["source"] == "supplier"]
+        self.assertEqual(len(supplier_rows), 2)
+        self.assertEqual(activity.data["supplierOutstanding"], "100.00")
+        self.assertEqual(activity.data["supplierPayments"], "600.00")
+        dash = self.client.get("/api/v1/finance/dashboard")
+        self.assertEqual(dash.status_code, 200, getattr(dash, "data", None))
+        self.assertEqual(dash.data["totalPaid"], "600.00")
+        self.assertEqual(dash.data["supplierOutstanding"], "100.00")
+
+    def test_generic_supplier_expense_and_outgoing_are_blocked_from_double_posting(self):
+        generic_payment = self.client.post("/api/v1/payments", {
+            "date": "2026-11-06", "direction": "OUT", "amount": "100.00",
+            "method": "Bank Transfer", "account": self.account_id,
+            "status": "Completed", "category": "Supplier Payment",
+        }, format="json")
+        self.assertEqual(generic_payment.status_code, 400)
+        duplicate_expense = self.client.post("/api/v1/expenses", {
+            "date": "2026-11-06", "amount": "100.00",
+            "category": "Spare Parts", "status": "Paid",
+            "account": self.account_id, "payment_method": "Bank Transfer",
+        }, format="json")
+        self.assertEqual(duplicate_expense.status_code, 400)
+        self.assertEqual(WorkshopAccountEntry.objects.count(), 0)
+
+    def test_supplier_purchase_split_cash_bank_credit_and_stock_once(self):
+        cash = self.client.post(f"{self.base}/accounts", {
+            "name": "Counter Cash", "kind": "Cash", "openingBalance": "150.00",
+        }, format="json")
+        self.assertEqual(cash.status_code, 201, getattr(cash, "data", None))
+        body = {
+            "supplierId": str(self.supplier.pk),
+            "invoiceNumber": "SPLIT-300-PURCHASE",
+            "invoiceDate": "2026-11-06",
+            "receiveIntoStock": True, "postNow": True,
+            "items": [{
+                "itemId": str(self.stock.pk),
+                "description": "Paint",
+                "quantity": "1", "purchaseRate": "300.00", "gstRate": "0",
+                "sellingPrice": "450.00", "updateItemPrices": True,
+            }],
+            "payments": [
+                {"accountId": cash.data["id"], "amount": "100.00",
+                 "method": "Cash", "kind": "Payment", "paidOn": "2026-11-06",
+                 "idempotencyKey": "split-cash-100-test"},
+                {"accountId": self.account_id, "amount": "100.00",
+                 "method": "Bank Transfer", "kind": "Payment", "paidOn": "2026-11-06",
+                 "idempotencyKey": "split-bank-100-test"},
+            ],
+        }
+        resp = self.client.post(f"{self.base}/bills", body, format="json")
+        self.assertEqual(resp.status_code, 201, getattr(resp, "data", None))
+        self.assertEqual(resp.data["paid"], "200.00")
+        self.assertEqual(resp.data["outstanding"], "100.00")
+        self.assertEqual(len(resp.data["payments"]), 2)
+        self.assertTrue(resp.data["createdAt"])
+        self.assertTrue(resp.data["postedAt"])
+        self.stock.refresh_from_db()
+        self.assertEqual(str(self.stock.on_hand), "3.00")
+        self.assertEqual(str(self.stock.cost_price), "300.00")
+        self.assertEqual(str(self.stock.selling_price), "450.00")
+        self.assertEqual(float(self.stock.tax), 0.0)
+        self.assertEqual(SupplierBill.objects.count(), 1)
+        self.assertEqual(SupplierPayment.objects.count(), 2)
+        self.assertEqual(WorkshopAccountEntry.objects.count(), 2)
+        self.assertEqual(self.summary()["outstanding"], "100.00")
+        accounts = self.client.get(f"{self.base}/accounts")
+        self.assertEqual(accounts.status_code, 200)
+        current = {row["id"]: row["recordedBalance"] for row in accounts.data}
+        self.assertEqual(current[cash.data["id"]], "50.00")
+        self.assertEqual(current[self.account_id], "19900.00")
+        retry = self.client.post(f"{self.base}/bills", body, format="json")
+        self.assertEqual(retry.status_code, 400)
+        self.assertEqual(SupplierPayment.objects.count(), 2)
+
+    def test_split_exceeding_total_rolls_back_bill_and_stock_and_ledger(self):
+        start_stock = str(self.stock.on_hand)
+        start_count = WorkshopAccountEntry.objects.count()
+        resp = self.client.post(f"{self.base}/bills", {
+            "supplierId": str(self.supplier.pk),
+            "invoiceNumber": "SPLIT-ROLLBACK-1",
+            "invoiceDate": "2026-11-06",
+            "receiveIntoStock": True, "postNow": True,
+            "items": [{
+                "itemId": str(self.stock.pk), "description": "Paint",
+                "quantity": "1", "purchaseRate": "200.00", "gstRate": "0",
+            }],
+            "payments": [{
+                "accountId": self.account_id, "amount": "250.00",
+                "method": "Bank Transfer", "paidOn": "2026-11-06",
+                "idempotencyKey": "invalid-over-total",
+            }],
+        }, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(SupplierBill.objects.filter(invoice_number="SPLIT-ROLLBACK-1").exists())
+        self.stock.refresh_from_db()
+        self.assertEqual(str(self.stock.on_hand), start_stock)
+        self.assertEqual(WorkshopAccountEntry.objects.count(), start_count)

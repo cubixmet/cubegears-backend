@@ -1,5 +1,6 @@
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import uuid4
+import re
 from django.conf import settings
 import mimetypes
 from django.http import FileResponse
@@ -14,11 +15,15 @@ from rest_framework.exceptions import ValidationError
 from common.viewsets import CompanyScopedModelViewSet
 from .models import Job,JobActivity,JobEstimate,JobPart,JobPhoto
 from .audit import record_job_event
+from .inspection_inputs import validate_finding, validate_diagnostic
+from .estimate_requests import estimate_identity, saved_estimate_identity, attach_identity
+from apps.customers.estimate_review import public_estimate
 from .serializers import JobSerializer,JobEstimateSerializer,JobPartSerializer,JobPhotoSerializer,JobActivitySerializer
 from .workflow import STAGES, NEXT_STATUS, workflow_state, stage_index_from_status
 from .complaint_status import sync_complaint_status, manual_complaint_status, unresolved_complaints, VALID_COMPLAINT_STATUSES
 from .india_gst import gst_context, calculate_tax, gst_rate
 from apps.invoices.gst_rate_options import find_gst_choice
+from apps.notifications.job_events import notify_job_event
 
 def _same_quick_create_phone(stored, supplied):
     """Allow verified +91 normalization of legacy 10-digit Indian contacts only."""
@@ -48,15 +53,19 @@ class JobViewSet(CompanyScopedModelViewSet):
         "inspection_photo": "jobs.edit",
         "inspection_complete": "jobs.edit",
         "inspection_skip": "jobs.edit",
+        "inspection_reopen": "jobs.edit",
         "work_skip": "jobs.edit",
         "work_service_add": "jobs.edit",
+        "work_service_remove": "jobs.edit",
         "complaint_status": "jobs.edit",
         "inspection_add_to_estimate": "jobs.edit",
         "estimates": {"GET": "jobs.view", "POST": "jobs.edit"},
         "quick_estimate": "jobs.edit",
         "quick_estimate_detail": "jobs.edit",
         "estimate_decision": "jobs.edit",
+        "estimate_share": "jobs.edit",
         "estimate_skip": "jobs.edit",
+        "estimate_reopen": "jobs.edit",
         "photos": {"GET": "jobs.view", "POST": "jobs.edit"},
         "upload_work_photo": "jobs.edit",
         "work_photo_file": "jobs.view",
@@ -196,8 +205,19 @@ class JobViewSet(CompanyScopedModelViewSet):
             )
 
     @transaction.atomic
-    def perform_update(self,serializer):
-        job = self.get_object()
+    def perform_update(self, serializer):
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(
+            pk=scoped.pk, company_id=self.request.user.company_id,
+        )
+        serializer.instance = job
+        if job.status == Job.STATUS_DELIVERED and any(
+            field not in {"customer_rating", "customer_feedback"}
+            for field in serializer.validated_data
+        ):
+            raise ValidationError({
+                "job": "Delivered Job Cards are locked. Customer feedback may still be recorded.",
+            })
         tracked = {
             key: getattr(job, key)
             for key in ("complaints", "work_updates", "qc", "work", "technician_id", "priority")
@@ -221,6 +241,21 @@ class JobViewSet(CompanyScopedModelViewSet):
             unlocked = workflow_state(job)["current"]
             if stage_index_from_status(next_status) > STAGES.index(unlocked):
                 raise ValidationError({"status": "Complete the current Job Card stage first."})
+            if stage_index_from_status(next_status) < stage_index_from_status(job.status):
+                raise ValidationError({
+                    "status": "Completed workflow stages cannot be reopened through a generic Job Card edit.",
+                })
+        if "work" in serializer.validated_data:
+            if workflow_state(job)["current"] != "work":
+                raise ValidationError({"work": "Work lines are editable only during the active Work stage."})
+            proposed_work = serializer.validated_data["work"]
+            if not isinstance(proposed_work, list) or len(proposed_work) > 500:
+                raise ValidationError({"work": "Work records must be a list of at most 500 entries."})
+            for posted in (job.work or []):
+                # Records created by the audited catalogue-service endpoint
+                # cannot be silently deleted or repriced through generic PATCH.
+                if isinstance(posted, dict) and posted.get("requestId") and posted not in proposed_work:
+                    raise ValidationError({"work": "Posted catalogue work cannot be changed through general Job Card edits."})
         if "qc" in serializer.validated_data:
             # The client can edit checklist/notes, but the inspector's identity
             # must always come from the authenticated user actually saving QC.
@@ -235,14 +270,20 @@ class JobViewSet(CompanyScopedModelViewSet):
                 "inspector": inspector_name,
                 "inspectorUserId": str(self.request.user.pk),
             }
+        technician = serializer.validated_data.get("technician")
+        if technician and job.branch_id and technician.branch_id and technician.branch_id != job.branch_id:
+            raise ValidationError({"technician": "Technician must belong to the Job Card branch."})
         self._guard_active_timers(job,next_status)
         updated = serializer.save()
         if "status" in serializer.validated_data or "complaints" in serializer.validated_data:
             if sync_complaint_status(updated):
                 updated.save(update_fields=["complaints", "updated_at"])
         if previous_status != updated.status:
-            record_job_event(updated, self.request.user, "Status Changed",
-                             f"{previous_status} → {updated.status}")
+            activity = record_job_event(updated, self.request.user, "Status Changed",
+                                        f"{previous_status} → {updated.status}")
+            notify_job_event(updated,
+                             "job_ready" if updated.status == Job.STATUS_READY else "job_status_changed",
+                             activity)
         tracked_events = {
             "complaints": "Customer Complaints Updated",
             "work_updates": "Technician Updates Saved",
@@ -258,8 +299,10 @@ class JobViewSet(CompanyScopedModelViewSet):
                 metadata = {"section": key}
                 if isinstance(after, list):
                     metadata["count"] = len(after)
-                record_job_event(updated, self.request.user, label,
-                                 f"{label} for {updated.job_number}", metadata)
+                activity = record_job_event(updated, self.request.user, label,
+                                            f"{label} for {updated.job_number}", metadata)
+                if key == "technician_id" and updated.technician_id:
+                    notify_job_event(updated, "job_assigned", activity)
 
 
     @transaction.atomic
@@ -271,6 +314,30 @@ class JobViewSet(CompanyScopedModelViewSet):
         from django.db.models.functions import Replace, Upper
 
         data = request.data.copy()
+        # Lock the real Company row for the whole creation transaction. A
+        # repeated request key returns the prior Job Card BEFORE attempting to
+        # create another Customer/Vehicle or consuming a new job number.
+        from apps.companies.models import Company
+        Company.objects.select_for_update().get(pk=request.user.company_id)
+        raw_request_id = data.get("clientRequestId")
+        self._job_create_request_id = ""
+        if raw_request_id not in (None, ""):
+            if not isinstance(raw_request_id, str) or not re.fullmatch(
+                r"[a-zA-Z0-9:_-]{12,120}", raw_request_id,
+            ):
+                raise ValidationError({
+                    "clientRequestId": "Use a unique 12–120 character request ID.",
+                })
+            self._job_create_request_id = raw_request_id
+            previous_job = Job.objects.filter(
+                company_id=request.user.company_id,
+                workflow_progress__createRequestId=raw_request_id,
+            ).first()
+            if previous_job is not None:
+                return response.Response(
+                    self.get_serializer(previous_job).data, status=status.HTTP_200_OK,
+                )
+
         vehicle_value = data.get("vehicle")
         # Also support a preselected existing customer with a typed/new vehicle.
         # A canonical customer+vehicle UUID payload without a registration still
@@ -426,6 +493,10 @@ class JobViewSet(CompanyScopedModelViewSet):
                 ).select_related("user").first()
                 if not employee:
                     raise ValidationError({input_key: "Choose an active staff member from your workshop."})
+                if branch and employee.branch_id and employee.branch_id != branch.pk:
+                    raise ValidationError({
+                        input_key: "Selected staff belongs to a different workshop branch.",
+                    })
                 if employee.user_id and employee.user.is_active:
                     data[target_key] = str(employee.user_id)
 
@@ -448,30 +519,84 @@ class JobViewSet(CompanyScopedModelViewSet):
             raise ValidationError({"vehicle":"Vehicle does not belong to the selected customer."})
         if technician and technician.company_id != company.id:
             raise ValidationError({"technician":"Technician belongs to another company."})
+        target_branch = getattr(self, "_job_create_branch", self.request.user.branch)
+        if technician and target_branch and technician.branch_id and technician.branch_id != target_branch.pk:
+            raise ValidationError({"technician": "Technician must belong to the Job Card branch."})
         advisor=serializer.validated_data.get("advisor") or self.request.user
         if advisor.company_id != company.id:
             raise ValidationError({"advisor":"Service advisor belongs to another company."})
-        count=Job.objects.filter(company=company).count()+1
-        number=serializer.validated_data.get("job_number") or f"JOB-{timezone.now().year}-{count:05d}"
-        job=serializer.save(company=company,branch=getattr(self, '_job_create_branch', self.request.user.branch),job_number=number,advisor=advisor)
-        JobActivity.objects.create(company=company,branch=job.branch,job=job,event="Job Created",description=f"{number} created",actor=self.request.user,to_status=job.status)
+        # The Company row is locked by create(); generated numbers never
+        # silently reuse an existing number after an earlier Job was deleted.
+        selected_branch = getattr(self, "_job_create_branch", self.request.user.branch)
+        if selected_branch and (
+            selected_branch.company_id != company.pk or not selected_branch.is_active
+        ):
+            raise ValidationError({"branchId": "Select an active workshop branch."})
+        number = str(serializer.validated_data.get("job_number") or "").strip()
+        if number:
+            if len(number) > 40 or Job.objects.filter(
+                company=company, job_number=number,
+            ).exists():
+                raise ValidationError({"jobNumber": "Job Card number is invalid or already in use."})
+        else:
+            sequence = Job.objects.filter(company=company).count() + 1
+            while True:
+                number = f"JOB-{timezone.now().year}-{sequence:05d}"
+                if not Job.objects.filter(company=company, job_number=number).exists():
+                    break
+                sequence += 1
+        progress = {}
+        if getattr(self, "_job_create_request_id", ""):
+            progress["createRequestId"] = self._job_create_request_id
+        job = serializer.save(
+            company=company, branch=selected_branch, job_number=number,
+            advisor=advisor, workflow_progress=progress,
+        )
+        activity = JobActivity.objects.create(
+            company=company, branch=job.branch, job=job,
+            event="Job Created", description=f"{number} created",
+            actor=self.request.user, to_status=job.status,
+        )
+        notify_job_event(job, "job_created", activity)
+        if job.technician_id:
+            notify_job_event(job, "job_assigned", activity)
 
-    @decorators.action(detail=True,methods=["patch"])
-    def status(self,request,pk=None):
-        job=self.get_object(); new_status=request.data.get("status")
-        if new_status not in FLOW: raise ValidationError({"status":"Invalid job status."})
+    @decorators.action(detail=True, methods=["patch"])
+    @transaction.atomic
+    def status(self, request, pk=None):
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        new_status = request.data.get("status")
+        if new_status not in FLOW:
+            raise ValidationError({"status": "Invalid Job Card status."})
+        if new_status == job.status:
+            return response.Response(self.get_serializer(job).data)
+        if stage_index_from_status(new_status) < stage_index_from_status(job.status):
+            raise ValidationError({
+                "status": "A completed Job Card stage cannot be reopened by changing its status.",
+            })
         if stage_index_from_status(new_status) > STAGES.index(workflow_state(job)["current"]):
-            raise ValidationError({"status":"Complete the current Job Card stage first."})
-        old=job.status
-        self._guard_active_timers(job,new_status)
-        if new_status==Job.STATUS_DELIVERED: job.delivered_at=timezone.now()
-        job.status=new_status
+            raise ValidationError({"status": "Complete the active Job Card stage first."})
+        old_status = job.status
+        self._guard_active_timers(job, new_status)
+        if new_status == Job.STATUS_DELIVERED:
+            job.delivered_at = timezone.now()
+        job.status = new_status
         fields = ["status", "delivered_at", "updated_at"]
         if sync_complaint_status(job):
             fields.append("complaints")
         job.save(update_fields=fields)
-        JobActivity.objects.create(company=job.company,branch=job.branch,job=job,event="Status Changed",description=f"{old} → {new_status}",actor=request.user,from_status=old,to_status=new_status)
-        return response.Response(JobSerializer(job).data)
+        activity = JobActivity.objects.create(
+            company=job.company, branch=job.branch, job=job,
+            event="Status Changed", description=f"{old_status} → {new_status}",
+            actor=request.user, from_status=old_status, to_status=new_status,
+        )
+        notify_job_event(job,
+                         "job_ready" if new_status == Job.STATUS_READY else "job_status_changed",
+                         activity)
+        return response.Response(self.get_serializer(job).data)
 
     @decorators.action(
         detail=True, methods=["post"],
@@ -564,20 +689,50 @@ class JobViewSet(CompanyScopedModelViewSet):
             if (job.inspection or {}).get("status") != "Completed":
                 raise ValidationError({"stage":"Finish the vehicle inspection checklist first."})
         elif stage == "estimate":
-            estimate = job.estimates.order_by("-created_at").first()
+            # Approve one explicit, immutable version. A stale browser must
+            # never accidentally authorize a newer quotation.
+            estimate = job.estimates.select_for_update().order_by("-version", "-created_at").first()
             if not estimate:
                 raise ValidationError({"stage":"Create an estimate before approval."})
-            if estimate.status != "Draft":
-                raise ValidationError({"stage":"Only the latest draft estimate can be approved. Save a revised estimate first."})
+            selected_id = request.data.get("estimateId")
+            if selected_id is not None and str(selected_id) != str(estimate.pk):
+                raise ValidationError({"estimateId": "The displayed estimate is no longer the latest version. Refresh before approving."})
+            selected_version = request.data.get("estimateVersion")
+            if selected_version is not None and str(selected_version) != str(estimate.version):
+                raise ValidationError({"estimateVersion": "The displayed estimate version changed. Refresh before approving."})
+            if estimate.status not in {"Draft", "Customer Approved"}:
+                raise ValidationError({"stage": "Only a draft or customer-accepted estimate can be finalized. Refresh the latest version."})
+            customer_decision = (job.workflow_progress or {}).get("customerEstimateDecision") or {}
+            portal_accepted = (
+                estimate.status == "Customer Approved"
+                and customer_decision.get("status") == "Accepted"
+                and customer_decision.get("estimateId") == str(estimate.pk)
+                and customer_decision.get("version") == estimate.version
+            )
+            if estimate.status == "Customer Approved" and not portal_accepted:
+                raise ValidationError({"stage": "Customer acceptance record does not match this estimate."})
+            if job.company.require_customer_estimate_approval and not portal_accepted:
+                raise ValidationError({"stage": "The customer must accept this exact published estimate in their portal."})
             if (job.inspection or {}).get("revisedAt"):
                 revised = parse_datetime(job.inspection["revisedAt"])
                 if revised and estimate.created_at < revised:
                     raise ValidationError({"stage": "Inspection changed. Save a revised estimate before approval."})
             if not request.data.get("approveEstimate"):
-                raise ValidationError({"stage":"Confirm customer estimate approval to continue."})
+                raise ValidationError({"stage":"Confirm the estimate before completing this stage."})
             estimate.status = "Approved"
             estimate.approved_at = timezone.now()
             estimate.save(update_fields=["status","approved_at","updated_at"])
+            # A staff attestation is not equivalent to an authenticated
+            # customer e-signature. Keep the source of confirmation explicit.
+            estimate_approval = {
+                "status": "Approved", "estimateId": str(estimate.pk),
+                "version": estimate.version, "total": str(estimate.total),
+                "confirmedByStaffId": str(request.user.pk),
+                "approvedAt": estimate.approved_at.isoformat(),
+                "confirmationSource": (
+                    "customer_portal_session" if portal_accepted else "workshop_staff_attestation"
+                ),
+            }
         elif stage == "work":
             if not request.data.get("confirmWorkDone"):
                 raise ValidationError({"stage":"Confirm that workshop work is complete."})
@@ -625,6 +780,9 @@ class JobViewSet(CompanyScopedModelViewSet):
             }
 
         progress = dict(job.workflow_progress or {})
+        if stage == "estimate":
+            progress["estimateDecision"] = estimate_approval
+            job.estimate_total = estimate.total
         if stage == "invoice":
             progress["delivery"] = delivery_record
         completed = set(state["completed"])
@@ -646,15 +804,21 @@ class JobViewSet(CompanyScopedModelViewSet):
         if stage == "invoice":
             job.delivered_at = timezone.now()
         fields = ["workflow_progress", "status", "delivered_at", "updated_at"]
+        if stage == "estimate":
+            fields.append("estimate_total")
         if sync_complaint_status(job):
             fields.append("complaints")
         job.save(update_fields=fields)
-        JobActivity.objects.create(
+        activity = JobActivity.objects.create(
             company=job.company,branch=job.branch,job=job,actor=request.user,
             event="Workflow Stage Completed",description=f"{stage} completed",
             from_status=old_status,to_status=job.status,
-            metadata={"stage":stage},
+            metadata={"stage": stage, **({"estimateApproval": estimate_approval} if stage == "estimate" else {})},
         )
+        if old_status != job.status:
+            notify_job_event(job,
+                             "job_ready" if job.status == Job.STATUS_READY else "job_status_changed",
+                             activity)
         return response.Response({
             **workflow_state(job),
             "job": JobSerializer(job).data,
@@ -759,6 +923,66 @@ class JobViewSet(CompanyScopedModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @decorators.action(
+        detail=True, methods=["delete"],
+        url_path=r"work/services/(?P<work_id>[^/.]+)",
+    )
+    @transaction.atomic
+    def work_service_remove(self, request, pk=None, work_id=None):
+        """Remove only a billable service entry in the active Work stage.
+
+        The customer selling charge disappears from the draft invoice suggestions,
+        but approved staff wages, issued parts and historical audit entries are
+        never deleted or modified by this operation.
+        """
+        from uuid import UUID
+        from apps.invoices.models import Invoice
+
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        if workflow_state(job)["current"] != "work":
+            raise ValidationError({"stage": "Services can only be removed during the Work stage."})
+        try:
+            normalized_id = str(UUID(str(work_id)))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({"workId": "Select a valid service entry."})
+        line = next(
+            (row for row in (job.work or []) if isinstance(row, dict)
+             and row.get("id") == normalized_id), None,
+        )
+        if not line or line.get("billable") is not True or not line.get("serviceId"):
+            raise ValidationError({"workId": "This saved service cannot be removed."})
+        if line.get("workerChargePosted") is True:
+            raise ValidationError({
+                "workId": "Worker charges are already posted; reverse them through the payroll workflow first."
+            })
+        if Invoice.objects.filter(company=job.company, job=job).exclude(
+            status="Cancelled"
+        ).exists():
+            raise ValidationError({
+                "workId": "An invoice already exists for this job; correct its billing before removing services."
+            })
+
+        job.work = [
+            row for row in (job.work or [])
+            if not (isinstance(row, dict) and row.get("id") == normalized_id)
+        ]
+        job.save(update_fields=["work", "updated_at"])
+        record_job_event(
+            job, request.user, "Job Service Removed",
+            f"Removed {line.get('service') or 'service'} from Work",
+            {
+                "workId": normalized_id,
+                "serviceId": line["serviceId"],
+                "quantity": line.get("quantity"),
+                "customerCharge": line.get("customerCharge"),
+                "agreedWorkerCharge": line.get("agreedWorkerCharge"),
+            },
+        )
+        return response.Response({"removedId": normalized_id, "job": JobSerializer(job).data})
+
     @decorators.action(detail=True, methods=["post"], url_path="work/skip")
     @transaction.atomic
     def work_skip(self, request, pk=None):
@@ -770,6 +994,7 @@ class JobViewSet(CompanyScopedModelViewSet):
         from apps.payroll.models import JobWorkSession
         from apps.inventory.models import StockMovement
         from .models import OutsideLabourCharge
+        from apps.invoices.models import Invoice
 
         scoped = self.get_object()
         job = Job.objects.select_for_update().get(pk=scoped.pk, company=scoped.company)
@@ -784,6 +1009,7 @@ class JobViewSet(CompanyScopedModelViewSet):
             or JobWorkSession.objects.filter(company=job.company, job=job).exists()
             or OutsideLabourCharge.objects.filter(company=job.company, job=job).exists()
             or job.parts.filter(issued=True).exists()
+            or Invoice.objects.filter(company=job.company, job=job).exclude(status="Cancelled").exists()
             or job.photos.filter(photo_type="work_update").exists()
             or StockMovement.objects.filter(
                 company=job.company, job=job,
@@ -892,55 +1118,163 @@ class JobViewSet(CompanyScopedModelViewSet):
         if previous != check_status: self._audit_inspection_change(job, f"{item} updated", previous, check_status)
         return response.Response(job.inspection)
 
-    @decorators.action(detail=True,methods=["post"],url_path="inspection/findings")
-    def inspection_findings(self,request,pk=None):
-        import uuid
-        job=self.get_object()
+    @decorators.action(detail=True, methods=["post"], url_path="inspection/findings")
+    @transaction.atomic
+    def inspection_findings(self, request, pk=None):
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(pk=scoped.pk, company=scoped.company)
         self._assert_inspection_editable(job)
-        data=dict(job.inspection or {}); findings=list(data.get("findings") or [])
-        finding={"id":f"FND-{uuid.uuid4().hex[:10].upper()}","dateTime":timezone.now().isoformat(),"addedToEstimate":False,"estimateStatus":"Not Added",**request.data}
-        findings.insert(0,finding); data["findings"]=findings; job.inspection=data; job.save(update_fields=["inspection","updated_at"])
+        payload = validate_finding(request.data)
+        data = dict(job.inspection or {})
+        findings = list(data.get("findings") or [])
+        if len(findings) >= 200:
+            raise ValidationError({"findings": "Maximum 200 findings per Job Card."})
+        finding = {
+            **payload,
+            "id": f"FND-{uuid4().hex[:10].upper()}",
+            "dateTime": timezone.now().isoformat(),
+            "addedToEstimate": False,
+            "estimateStatus": "Not Added",
+        }
+        findings.insert(0, finding)
+        data["findings"] = findings
+        job.inspection = data
+        job.save(update_fields=["inspection", "updated_at"])
         self._audit_inspection_change(job, "Finding added", None, finding)
-        return response.Response(finding,status=status.HTTP_201_CREATED)
+        record_job_event(job, request.user, "Inspection Finding Added",
+                         finding["description"], {"findingId": finding["id"],
+                         "severity": finding["severity"]})
+        return response.Response(finding, status=status.HTTP_201_CREATED)
 
-    @decorators.action(detail=True,methods=["put","delete"],url_path=r"inspection/findings/(?P<finding_id>[^/.]+)")
-    def inspection_finding_detail(self,request,pk=None,finding_id=None):
-        job=self.get_object()
+    @decorators.action(detail=True, methods=["put", "delete"],
+                       url_path=r"inspection/findings/(?P<finding_id>[^/.]+)")
+    @transaction.atomic
+    def inspection_finding_detail(self, request, pk=None, finding_id=None):
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(pk=scoped.pk, company=scoped.company)
         self._assert_inspection_editable(job)
-        data=dict(job.inspection or {}); findings=list(data.get("findings") or [])
-        idx=next((i for i,x in enumerate(findings) if str(x.get("id"))==str(finding_id)),None)
-        if idx is None: return response.Response({"message":"Finding not found."},status=404)
-        if request.method=="DELETE":
-            removed=findings.pop(idx); data["findings"]=findings; job.inspection=data; job.save(update_fields=["inspection","updated_at"])
+        data = dict(job.inspection or {})
+        findings = list(data.get("findings") or [])
+        index = next((i for i, entry in enumerate(findings)
+                      if str(entry.get("id")) == str(finding_id)), None)
+        if index is None:
+            return response.Response({"message": "Finding not found."}, status=404)
+        original = dict(findings[index])
+        if request.method == "DELETE":
+            if original.get("addedToEstimate"):
+                raise ValidationError({
+                    "finding": "Remove this finding from the draft estimate before deleting it.",
+                })
+            removed = findings.pop(index)
+            data["findings"] = findings
+            job.inspection = data
+            job.save(update_fields=["inspection", "updated_at"])
             self._audit_inspection_change(job, "Finding removed", removed, None)
+            record_job_event(job, request.user, "Inspection Finding Removed",
+                             str(removed.get("description") or ""),
+                             {"findingId": str(finding_id)})
             return response.Response(removed)
-        old_finding = dict(findings[idx])
-        findings[idx]={**findings[idx],**request.data}; data["findings"]=findings; job.inspection=data; job.save(update_fields=["inspection","updated_at"])
-        self._audit_inspection_change(job, "Finding edited", old_finding, findings[idx])
-        return response.Response(findings[idx])
 
-    @decorators.action(detail=True,methods=["post"],url_path="inspection/diagnostic")
-    def inspection_diagnostic(self,request,pk=None):
-        import uuid
-        job=self.get_object()
+        editable_keys = (
+            "description", "title", "category", "severity", "recommendedAction",
+            "technicianFinding", "requiredParts", "estimatedLabourTime",
+            "estimatedLabourCharge", "estimatedPartCharge", "estimatedCost",
+            "complaintId", "notes",
+        )
+        combined = {key: original[key] for key in editable_keys if key in original}
+        combined.update({
+            key: value for key, value in request.data.items() if key in editable_keys
+        })
+        validated = validate_finding(combined)
+        finding = {**original, **validated}
+        # Never accept client-supplied IDs, server timestamps, approval flags,
+        # estimate status, or raw image contents.
+        findings[index] = finding
+        data["findings"] = findings
+        job.inspection = data
+        job.save(update_fields=["inspection", "updated_at"])
+        self._audit_inspection_change(job, "Finding edited", original, finding)
+        record_job_event(job, request.user, "Inspection Finding Updated",
+                         str(finding.get("description") or ""),
+                         {"findingId": str(finding_id)})
+        return response.Response(finding)
+
+    @decorators.action(detail=True, methods=["post"], url_path="inspection/diagnostic")
+    @transaction.atomic
+    def inspection_diagnostic(self, request, pk=None):
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(pk=scoped.pk, company=scoped.company)
         self._assert_inspection_editable(job)
-        data=dict(job.inspection or {}); scan=dict(data.get("diagnosticScan") or {})
-        codes=list(scan.get("codes") or []); code={"id":f"OBD-{uuid.uuid4().hex[:8].upper()}",**request.data}
-        codes.append(code); scan.update({"performed":True,"scanTime":timezone.now().isoformat(),"codes":codes}); data["diagnosticScan"]=scan
-        job.inspection=data; job.save(update_fields=["inspection","updated_at"])
+        payload = validate_diagnostic(request.data)
+        data = dict(job.inspection or {})
+        scan = dict(data.get("diagnosticScan") or {})
+        codes = list(scan.get("codes") or [])
+        if len(codes) >= 200:
+            raise ValidationError({"diagnostic": "Maximum 200 diagnostic codes."})
+        code = {
+            **payload, "id": f"OBD-{uuid4().hex[:8].upper()}",
+            "dateTime": timezone.now().isoformat(),
+            "recordedById": str(request.user.pk),
+        }
+        codes.append(code)
+        scan.update({
+            "performed": True, "scanTime": timezone.now().isoformat(),
+            "codes": codes,
+        })
+        data["diagnosticScan"] = scan
+        job.inspection = data
+        job.save(update_fields=["inspection", "updated_at"])
         self._audit_inspection_change(job, "Diagnostic code added", None, code)
-        return response.Response(code,status=201)
+        record_job_event(job, request.user, "Diagnostic Code Recorded",
+                         code["code"], {"diagnosticId": code["id"]})
+        return response.Response(code, status=status.HTTP_201_CREATED)
 
-    @decorators.action(detail=True,methods=["post"],url_path="inspection/photos")
-    def inspection_photo(self,request,pk=None):
-        import uuid
-        job=self.get_object()
+    @decorators.action(detail=True, methods=["post"], url_path="inspection/photos")
+    @transaction.atomic
+    def inspection_photo(self, request, pk=None):
+        """Reference a real private image; never persist Base64 or an arbitrary URL."""
+        from apps.vehicles.models import VehicleInspectionPhoto
+        from uuid import UUID
+
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(pk=scoped.pk, company=scoped.company)
         self._assert_inspection_editable(job)
-        data=dict(job.inspection or {}); photos=list(data.get("photos") or [])
-        photo={"id":f"PH-{uuid.uuid4().hex[:8].upper()}","dateTime":timezone.now().isoformat(),**request.data}
-        photos.append(photo); data["photos"]=photos; job.inspection=data; job.save(update_fields=["inspection","updated_at"])
-        self._audit_inspection_change(job, "Inspection photo added", None, {"id": photo["id"], "caption": photo.get("caption")})
-        return response.Response(photo,status=201)
+        raw_photo_id = request.data.get("photoId")
+        try:
+            photo_id = UUID(str(raw_photo_id))
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError({
+                "photoId": "Upload the photo through the private inspection photo API first.",
+            })
+        saved = VehicleInspectionPhoto.objects.filter(
+            pk=photo_id, company=job.company, vehicle=job.vehicle, job=job,
+        ).first()
+        if saved is None or not saved.file:
+            raise ValidationError({"photoId": "Photo does not belong to this Job Card."})
+        data = dict(job.inspection or {})
+        photos = list(data.get("photos") or [])
+        existing = next((p for p in photos
+                         if str(p.get("privatePhotoId")) == str(saved.pk)), None)
+        if existing:
+            return response.Response(existing)
+        if len(photos) >= 250:
+            raise ValidationError({"photos": "Maximum 250 photos per inspection."})
+        record = {
+            "id": f"PH-{saved.pk.hex[:12].upper()}",
+            "privatePhotoId": str(saved.pk),
+            "category": saved.category,
+            "caption": saved.caption,
+            "dateTime": saved.captured_at.isoformat(),
+        }
+        photos.append(record)
+        data["photos"] = photos
+        job.inspection = data
+        job.save(update_fields=["inspection", "updated_at"])
+        self._audit_inspection_change(job, "Inspection photo linked", None, record)
+        record_job_event(job, request.user, "Inspection Photo Linked",
+                         saved.caption or "Private inspection photo",
+                         {"photoId": str(saved.pk)})
+        return response.Response(record, status=status.HTTP_201_CREATED)
 
     @decorators.action(detail=True,methods=["post"],url_path="inspection/complete")
     @transaction.atomic
@@ -1020,6 +1354,70 @@ class JobViewSet(CompanyScopedModelViewSet):
             "job": JobSerializer(job).data,
         })
 
+    @decorators.action(detail=True, methods=["post"], url_path="inspection/reopen")
+    @transaction.atomic
+    def inspection_reopen(self, request, pk=None):
+        """Reopen a skipped inspection before downstream estimate approval/work.
+
+        The prior skip remains in JobActivity and a preserved skipHistory;
+        generic job updates cannot forge or undo the workflow transition.
+        """
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        data = dict(job.inspection or {})
+        if data.get("status") != "Skipped":
+            raise ValidationError({"inspection": "Only a skipped inspection can be reopened."})
+        state = workflow_state(job)
+        if state["current"] != "estimate" or (
+            (job.workflow_progress or {}).get("estimateDecision") or {}
+        ).get("status") == "Skipped":
+            raise ValidationError({
+                "inspection": "Reopen the skipped Estimate first, or finish the current stage before requesting changes."
+            })
+        if job.estimates.filter(
+            status__in=["Approved", "Awaiting Customer", "Customer Approved"],
+        ).exists():
+            raise ValidationError({
+                "inspection": "An approved or customer-shared estimate blocks reopening this inspection."
+            })
+        now = timezone.now().isoformat()
+        skip_receipt = {key: data.get(key) for key in (
+            "skipReason", "skippedAt", "skippedById", "skippedBy",
+        ) if data.get(key)}
+        history = list(data.get("skipHistory") or [])
+        history.append(skip_receipt)
+        for key in ("skipReason", "skippedAt", "skippedById", "skippedBy"):
+            data.pop(key, None)
+        data.update({
+            "status": "In Progress", "skipHistory": history,
+            "reopenedAt": now, "reopenedById": str(request.user.pk),
+            "revisedAt": now,
+        })
+        progress = dict(job.workflow_progress or {})
+        progress["completed"] = [stage for stage in STAGES
+                                  if stage in set(state["completed"]) and stage != "inspection"]
+        progress["skipped"] = [stage for stage in STAGES
+                                if stage in set(progress.get("skipped") or []) and stage != "inspection"]
+        details = dict(progress.get("skipDetails") or {})
+        details.pop("inspection", None)
+        progress["skipDetails"] = details
+        previous_status = job.status
+        job.inspection, job.workflow_progress = data, progress
+        job.status = Job.STATUS_INSPECTION
+        job.save(update_fields=["inspection", "workflow_progress", "status", "updated_at"])
+        record_job_event(
+            job, request.user, "Inspection Reopened",
+            "Previously skipped inspection reopened for corrections",
+            {"stage": "inspection", "previousSkip": skip_receipt,
+             "reopenedAt": now, "fromStatus": previous_status, "toStatus": job.status},
+        )
+        return response.Response({
+            "inspection": data, "workflow": workflow_state(job),
+            "job": JobSerializer(job).data,
+        })
+
     @decorators.action(detail=True,methods=["post"],url_path=r"inspection/findings/(?P<finding_id>[^/.]+)/add-to-estimate")
     def inspection_add_to_estimate(self,request,pk=None,finding_id=None):
         job=self.get_object()
@@ -1031,6 +1429,73 @@ class JobViewSet(CompanyScopedModelViewSet):
         job.save(update_fields=["inspection","updated_at"])
         self._audit_inspection_change(job, "Finding marked for estimate", None, finding)
         return response.Response(finding)
+
+    @decorators.action(
+        detail=True, methods=["post"],
+        url_path=r"estimates/(?P<estimate_id>[^/.]+)/share",
+    )
+    @transaction.atomic
+    def estimate_share(self, request, pk=None, estimate_id=None):
+        """Explicitly publish/withdraw only the newest draft for customer review."""
+        job = Job.objects.select_for_update().get(
+            pk=self.get_object().pk, company=request.user.company,
+        )
+        if workflow_state(job)["current"] != "estimate":
+            raise ValidationError({"estimate": "Customer review is closed after the estimate stage."})
+        estimate = job.estimates.select_for_update().filter(pk=estimate_id).first()
+        latest = job.estimates.order_by("-version", "-created_at").first()
+        if not estimate or not latest or estimate.pk != latest.pk:
+            raise ValidationError({"estimate": "Only the latest estimate can be shared or withdrawn."})
+        action = request.data.get("action", "share")
+        if action not in {"share", "withdraw"}:
+            raise ValidationError({"action": "Choose share or withdraw."})
+        if action == "share":
+            if estimate.status == "Awaiting Customer":
+                return response.Response(JobEstimateSerializer(estimate).data)
+            if estimate.status != "Draft":
+                raise ValidationError({"estimate": "Only a draft can be shared for customer review."})
+            revised = parse_datetime((job.inspection or {}).get("revisedAt") or "")
+            if revised and estimate.created_at < revised:
+                raise ValidationError({"estimate": "Inspection changed; save a revised estimate first."})
+            # Consent requires an itemized quote whose lines, discount, tax and
+            # total agree exactly. Incomplete historical quotes need revision.
+            if not public_estimate(estimate)["reviewable"]:
+                raise ValidationError({
+                    "estimate": "Save a complete itemized estimate with reconciled totals before sharing."
+                })
+            estimate.status = "Awaiting Customer"
+            event = "Estimate Shared With Customer"
+        else:
+            if estimate.status == "Draft":
+                return response.Response(JobEstimateSerializer(estimate).data)
+            if estimate.status != "Awaiting Customer":
+                raise ValidationError({"estimate": "A customer-decided estimate cannot be withdrawn."})
+            estimate.status = "Draft"
+            event = "Customer Estimate Withdrawn"
+        estimate.save(update_fields=["status", "updated_at"])
+        record_job_event(
+            job, request.user, event, f"Estimate V{estimate.version}: {action}",
+            {"estimateId": str(estimate.pk), "version": estimate.version,
+             "total": str(estimate.total)},
+        )
+        if action == "share":
+            # A published quote may trigger the workshop's preconfigured,
+            # consent-gated Meta notification. It must never delay the staff
+            # response or send before this transaction commits.
+            from apps.whatsapp.tasks import queue_customer_notification
+            job_id, company_id, quote_id = job.pk, job.company_id, estimate.pk
+
+            def notify_customer():
+                current = Job.objects.select_related("customer", "vehicle").filter(
+                    pk=job_id, company_id=company_id,
+                ).first()
+                if current:
+                    queue_customer_notification(
+                        current.customer, "estimate_shared",
+                        f"estimate:{quote_id}:shared", job=current,
+                    )
+            transaction.on_commit(notify_customer)
+        return response.Response(JobEstimateSerializer(estimate).data)
 
     @decorators.action(
         detail=True, methods=["post"],
@@ -1069,8 +1534,8 @@ class JobViewSet(CompanyScopedModelViewSet):
         state = workflow_state(job)
         if state["current"] != "estimate":
             raise ValidationError({"estimate": "Only the active Estimate stage can be skipped."})
-        if (job.inspection or {}).get("status") != "Completed":
-            raise ValidationError({"inspection": "Complete the required inspection before skipping an estimate."})
+        if (job.inspection or {}).get("status") not in {"Completed", "Skipped"}:
+            raise ValidationError({"inspection": "Complete or explicitly skip inspection before skipping an estimate."})
         if job.estimates.filter(status="Approved").exists():
             raise ValidationError({"estimate": "An approved estimate cannot be skipped."})
         if job.company.require_customer_estimate_approval:
@@ -1121,6 +1586,73 @@ class JobViewSet(CompanyScopedModelViewSet):
             job, request.user, "Estimate Skipped",
             f"Estimate skipped: {reason}",
             {**decision, "stage": "estimate"},
+        )
+        return response.Response({**workflow_state(job), "job": JobSerializer(job).data})
+
+    @decorators.action(detail=True, methods=["post"], url_path="estimate/reopen")
+    @transaction.atomic
+    def estimate_reopen(self, request, pk=None):
+        """Undo a skipped Estimate before any work/stock/payroll/billing activity."""
+        from apps.payroll.models import JobWorkSession
+        from apps.inventory.models import StockMovement
+        from .models import OutsideLabourCharge
+
+        scoped = self.get_object()
+        job = Job.objects.select_for_update().get(
+            pk=scoped.pk, company_id=request.user.company_id,
+        )
+        progress = dict(job.workflow_progress or {})
+        decision = dict(progress.get("estimateDecision") or {})
+        if decision.get("status") != "Skipped":
+            raise ValidationError({"estimate": "Only a skipped Estimate can be reopened."})
+        if workflow_state(job)["current"] != "work":
+            raise ValidationError({
+                "estimate": "Estimate can only be reopened before Work advances to QC or billing."
+            })
+        if job.estimates.filter(
+            status__in=["Approved", "Awaiting Customer", "Customer Approved"],
+        ).exists():
+            raise ValidationError({"estimate": "An approved or shared estimate cannot be reopened."})
+        if (
+            job.work or job.work_updates or (job.qc or {}).get("status")
+            or JobWorkSession.objects.filter(company=job.company, job=job).exists()
+            or OutsideLabourCharge.objects.filter(company=job.company, job=job).exists()
+            or job.parts.filter(issued=True).exists()
+            or job.photos.filter(photo_type="work_update").exists()
+            or StockMovement.objects.filter(
+                company=job.company, job=job,
+                movement_type__in=("job_issue", "return"),
+            ).exists()
+            or any(
+                item.get("status", "Purchased") == "Purchased"
+                for item in (job.parts_workflow or {}).get("outsideParts", [])
+                if isinstance(item, dict)
+            )
+        ):
+            raise ValidationError({
+                "estimate": "Work, labour, stock or QC has already been recorded. Reopening would invalidate those records."
+            })
+        now = timezone.now().isoformat()
+        history = list(progress.get("estimateSkipHistory") or [])
+        history.append(decision)
+        progress["estimateSkipHistory"] = history
+        progress["estimateDecision"] = {"status": "Pending"}
+        progress["completed"] = [stage for stage in STAGES
+                                  if stage in set(workflow_state(job)["completed"]) and stage != "estimate"]
+        progress["skipped"] = [stage for stage in STAGES
+                                if stage in set(progress.get("skipped") or []) and stage != "estimate"]
+        details = dict(progress.get("skipDetails") or {})
+        details.pop("estimate", None)
+        progress["skipDetails"] = details
+        previous_status = job.status
+        job.workflow_progress = progress
+        job.status = Job.STATUS_ESTIMATE_PENDING
+        job.save(update_fields=["workflow_progress", "status", "updated_at"])
+        record_job_event(
+            job, request.user, "Estimate Reopened",
+            "Previously skipped estimate reopened for editing",
+            {"stage": "estimate", "previousSkip": decision,
+             "reopenedAt": now, "fromStatus": previous_status, "toStatus": job.status},
         )
         return response.Response({**workflow_state(job), "job": JobSerializer(job).data})
 
@@ -1276,9 +1808,23 @@ class JobViewSet(CompanyScopedModelViewSet):
     @transaction.atomic
     def quick_estimate(self, request, pk=None):
         job = Job.objects.select_for_update().get(pk=self.get_object().pk, company=request.user.company)
+        identity = estimate_identity(request.data)
+        if identity:
+            # The job row lock serializes concurrent requests for this quote.
+            # A retry returns the original version without a second activity.
+            for previous in job.estimates.order_by("-version", "-created_at"):
+                saved = saved_estimate_identity(previous)
+                if saved and saved[0] == identity[0]:
+                    if saved[1] != identity[1]:
+                        raise ValidationError({"requestId": "This request ID was already used with different estimate values."})
+                    return response.Response(JobEstimateSerializer(previous).data)
         if workflow_state(job)["current"] != "estimate":
             raise ValidationError({"estimate": "Only the active Estimate stage can create a quotation."})
+        latest = job.estimates.order_by("-version", "-created_at").first()
+        if latest and latest.status in {"Awaiting Customer", "Customer Approved"}:
+            raise ValidationError({"estimate": "The latest estimate is under customer review or accepted. Withdraw it before editing."})
         values = self._quick_estimate_values(request.data)
+        attach_identity(values["items"], identity)
         version = (job.estimates.order_by("-version").values_list("version", flat=True).first() or 0) + 1
         obj = JobEstimate.objects.create(
             company=job.company, branch=job.branch, job=job,
@@ -1296,7 +1842,7 @@ class JobViewSet(CompanyScopedModelViewSet):
                        url_path=r"estimates/quick/(?P<estimate_id>[^/.]+)")
     @transaction.atomic
     def quick_estimate_detail(self, request, pk=None, estimate_id=None):
-        job = self.get_object()
+        job = Job.objects.select_for_update().get(pk=self.get_object().pk, company=request.user.company)
         if workflow_state(job)["current"] != "estimate":
             raise ValidationError({"estimate": "Estimate editing is closed after approval."})
         draft = JobEstimate.objects.select_for_update().filter(
@@ -1306,7 +1852,17 @@ class JobViewSet(CompanyScopedModelViewSet):
             raise ValidationError({"estimate": "Estimate not found for this Job Card."})
         if draft.status != "Draft":
             raise ValidationError({"estimate": "Only draft estimates can be edited."})
+        latest = job.estimates.order_by("-version", "-created_at").first()
+        if latest.pk != draft.pk:
+            raise ValidationError({"estimate": "Only the latest draft estimate can be edited. Refresh the Job Card."})
+        identity = estimate_identity(request.data)
+        existing_identity = saved_estimate_identity(draft)
+        if identity and existing_identity and identity[0] == existing_identity[0]:
+            if identity[1] != existing_identity[1]:
+                raise ValidationError({"requestId": "This request ID was already used with different estimate values."})
+            return response.Response(JobEstimateSerializer(draft).data)
         values = self._quick_estimate_values(request.data)
+        attach_identity(values["items"], identity)
         for field, value in values.items():
             setattr(draft, field, value)
         draft.save(update_fields=[*values.keys(), "updated_at"])
@@ -1326,6 +1882,9 @@ class JobViewSet(CompanyScopedModelViewSet):
                 raise ValidationError({"estimate": "Create estimates only during the Estimate stage."})
             if request.data.get("status", "Draft") != "Draft":
                 raise ValidationError({"status": "Only draft estimates can be created."})
+            latest = job.estimates.order_by("-version", "-created_at").first()
+            if latest and latest.status in {"Awaiting Customer", "Customer Approved"}:
+                raise ValidationError({"estimate": "Withdraw the shared estimate before saving another version."})
             s=JobEstimateSerializer(data=request.data); s.is_valid(raise_exception=True)
             version = (job.estimates.order_by("-version").values_list("version", flat=True).first() or 0) + 1
             obj=s.save(company=job.company,branch=job.branch,job=job,
@@ -1433,6 +1992,8 @@ class JobViewSet(CompanyScopedModelViewSet):
         from decimal import InvalidOperation
         from django.core.exceptions import ValidationError as DjangoValidationError
         from apps.inventory.models import StockItem, StockMovement
+        from apps.inventory.branch_stock import locked_branch_balance, available_in_branch, move_balance
+        from apps.accounts.permissions import user_has_permission
 
         job = self.get_object()  # Company scoped; permissions also require jobs.edit + stock.edit.
         item_id = request.data.get("item")
@@ -1454,12 +2015,28 @@ class JobViewSet(CompanyScopedModelViewSet):
         except (StockItem.DoesNotExist, ValueError, TypeError, DjangoValidationError):
             raise ValidationError({"item": "Stock item not found in this workshop."})
 
-        expected_branch_id = job.branch_id or getattr(request.user, "branch_id", None)
-        if item.branch_id and item.branch_id != expected_branch_id:
-            raise ValidationError({"item": "This stock item belongs to another branch."})
-        if item.available_quantity < qty:
-            raise ValidationError({"quantity": "Insufficient available stock."})
+        expected_branch = job.branch or request.user.branch
+        if job.branch_id and request.user.branch_id and job.branch_id != request.user.branch_id:
+            if not user_has_permission(request.user, "stock.manage"):
+                raise ValidationError({"branch": "Only an authorized source-branch staff member may issue parts."})
+        branch_balance = locked_branch_balance(item, expected_branch)
+        idempotency_key = str(request.headers.get("Idempotency-Key") or "").strip()
+        if idempotency_key and (len(idempotency_key) > 48 or not idempotency_key.isascii() or not all(ch.isalnum() or ch in "-_" for ch in idempotency_key)):
+            raise ValidationError({"idempotencyKey": "Use an ASCII alphanumeric idempotency key (max 48 characters)."})
+        movement_reference = f"job-issue:{job.pk}:{idempotency_key}" if idempotency_key else job.job_number
+        if idempotency_key:
+            existing = StockMovement.objects.filter(company=job.company, item=item, job=job, movement_type="job_issue", reference=movement_reference).first()
+            if existing:
+                if existing.quantity != -qty:
+                    raise ValidationError({"idempotencyKey": "This key was already used for a different quantity."})
+                part = job.parts.filter(item=item, issued=True, pk=existing.note.removeprefix("jobPart:")).first() if existing.note.startswith("jobPart:") else None
+                if part:
+                    return response.Response(JobPartSerializer(part).data, status=status.HTTP_200_OK)
+                raise ValidationError({"idempotencyKey": "Existing stock issue requires reconciliation; no additional stock was deducted."})
+        if available_in_branch(branch_balance) < qty or item.on_hand - item.reserved < qty:
+            raise ValidationError({"quantity": "Insufficient available stock at this branch."})
 
+        move_balance(branch_balance, -qty)
         item.on_hand -= qty
         item.save(update_fields=["on_hand", "updated_at"])
         part = JobPart.objects.create(
@@ -1467,10 +2044,10 @@ class JobViewSet(CompanyScopedModelViewSet):
             job=job, item=item, quantity=qty, unit_price=item.selling_price, issued=True,
         )
         StockMovement.objects.create(
-            company=job.company, branch=item.branch or job.branch or request.user.branch,
+            company=job.company, branch=expected_branch,
             item=item, movement_type="job_issue", quantity=-qty,
-            unit_cost=item.cost_price, reference=job.job_number,
-            job=job, created_by=request.user,
+            unit_cost=item.cost_price, reference=movement_reference,
+            note=f"jobPart:{part.pk}", job=job, created_by=request.user,
         )
         record_job_event(job, request.user, "Part Issued",
                          f"{item.name} × {qty}", {"partId": str(part.pk)})
