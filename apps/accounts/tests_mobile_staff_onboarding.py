@@ -54,6 +54,49 @@ class MobileStaffOnboardingTests(TestCase):
         self.assertEqual(result.status_code, 201, getattr(result,"data",None))
         return result
 
+    def test_unknown_email_cannot_issue_password_reset_or_magic_login_link(self):
+        # Anonymous requests must not create credentials, queue mail or
+        # disclose whether this email is registered to any workshop.
+        from apps.accounts.models import MagicLink
+
+        before_users = User.objects.count()
+        before_magic_links = MagicLink.objects.count()
+        with (
+            patch("apps.accounts.views.queue_email") as enqueue,
+            patch("apps.accounts.views.MagicLink.issue") as issue,
+        ):
+            reset = self.public.post(
+                "/api/v1/auth/forgot-password",
+                {"email": "nobody@example.invalid"}, format="json",
+            )
+            magic = self.public.post(
+                "/api/v1/auth/magic-link",
+                {"email": "nobody@example.invalid"}, format="json",
+            )
+        self.assertEqual(reset.status_code, 200, reset.data)
+        self.assertEqual(magic.status_code, 200, magic.data)
+        self.assertNotIn("token", reset.data)
+        self.assertNotIn("token", magic.data)
+        enqueue.assert_not_called()
+        issue.assert_not_called()
+        self.assertEqual(User.objects.count(), before_users)
+        self.assertEqual(MagicLink.objects.count(), before_magic_links)
+
+    def test_missing_email_and_wrong_password_have_indistinguishable_login_errors(self):
+        unknown = self.public.post(
+            "/api/v1/auth/login",
+            {"identifier": "nobody@example.invalid", "password": "NotThePassword!"}, format="json",
+        )
+        incorrect = self.public.post(
+            "/api/v1/auth/login",
+            {"identifier": self.owner.email, "password": "NotThePassword!"}, format="json",
+        )
+        self.assertEqual(unknown.status_code, 400, unknown.data)
+        self.assertEqual(incorrect.status_code, 400, incorrect.data)
+        self.assertEqual(unknown.data, incorrect.data)
+        self.assertNotIn("access", unknown.data)
+        self.assertNotIn("refresh", incorrect.data)
+
     def test_phone_format_is_international_and_does_not_infer_country(self):
         self.assertEqual(normalize_phone(" +91 (93333) 33333 "),"+919333333333")
         from django.core.exceptions import ValidationError
@@ -603,3 +646,55 @@ class MobileStaffOnboardingTests(TestCase):
         self.assertEqual(result.status_code, 404)
         employee.refresh_from_db()
         self.assertTrue(employee.whatsapp_consent)
+
+    def test_public_signup_and_invitation_rate_limits_do_not_share_anonymous_bucket(self):
+        # Invalid HMAC links cannot grant access; however opening the setup UI
+        # repeatedly should not consume the separate registration quota.
+        validation = "/api/v1/auth/staff-invitation/validate"
+        signup = "/api/v1/auth/signup"
+        for _ in range(7):
+            result = self.public.post(
+                validation, {"token": "invalid-link"}, format="json"
+            )
+            self.assertEqual(result.status_code, 400, result.data)
+
+        self.assertEqual(
+            self.public.post(signup, {}, format="json").status_code, 400
+        )
+        for _ in range(4):
+            self.assertEqual(
+                self.public.post(signup, {}, format="json").status_code, 400
+            )
+        self.assertEqual(
+            self.public.post(signup, {}, format="json").status_code, 429
+        )
+        # Exhausting signup must not block verification or password saving.
+        self.assertEqual(
+            self.public.post(validation, {"token": "invalid-link"}, format="json").status_code,
+            400,
+        )
+        self.assertEqual(
+            self.public.post("/api/v1/auth/staff-invitation/consume", {
+                "token": "invalid-link",
+                "password": "ValidTestPassword123!",
+                "confirmPassword": "ValidTestPassword123!",
+            }, format="json").status_code,
+            400,
+        )
+
+    @override_settings(FRONTEND_URL="https://app.cubixgear.tech")
+    def test_password_invitation_identifies_workshop_owner_without_disclosing_identity(self):
+        from apps.accounts.staff_setup import issue_invitation, invitation_url
+
+        self.owner.set_unusable_password()
+        self.owner.save(update_fields=["password"])
+        record = issue_invitation(self.owner)
+        token = invitation_url(record).rsplit("/", 1)[-1]
+        response = self.public.post(
+            "/api/v1/auth/staff-invitation/validate", {"token": token}, format="json"
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data["valid"])
+        self.assertEqual(response.data["accountType"], "owner")
+        self.assertNotIn("email", response.data)
+        self.assertNotIn("phone", response.data)

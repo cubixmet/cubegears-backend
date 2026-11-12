@@ -1,6 +1,7 @@
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.utils.text import slugify
+from django.utils.crypto import constant_time_compare
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
@@ -12,10 +13,12 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.views import TokenRefreshView
+from rest_framework_simplejwt.settings import api_settings
+from rest_framework_simplejwt.utils import get_md5_hash_password
 
 from .models import MagicLink
 from .staff_setup import issue_invitation, invitation_url, resolve_invitation, consume_invitation
-from .email import queue_email
+from .email import queue_email, email_delivery_mode
 from .account_links import is_platform_account, password_action_url, magic_action_url
 from .serializers import (
     ChangePasswordSerializer,
@@ -37,7 +40,16 @@ from apps.roles.models import Role
 User = get_user_model()
 
 
+def unique_active_email_user(email):
+    """Reject ambiguous legacy email identifiers in recovery as in login."""
+    matches = list(User.objects.filter(email__iexact=email, is_active=True)[:2])
+    return matches[0] if len(matches) == 1 else None
+
+
 class PublicSignupRateThrottle(AnonRateThrottle):
+    # Do not share DRF's default "anon" cache bucket with verification,
+    # recovery, login or other public actions.
+    scope = "workshop_public_signup"
     rate = "5/hour"
 
 
@@ -53,7 +65,22 @@ class TokenRefreshRateThrottle(AnonRateThrottle):
 
 
 class RecoveryRateThrottle(AnonRateThrottle):
+    scope = "workshop_recovery"
     rate = "5/hour"
+
+
+class InvitationValidateRateThrottle(AnonRateThrottle):
+    # A page opening (and React development remount) validates a link.
+    # Reserve a separate, still bounded bucket for these read-only checks.
+    scope = "workshop_invitation_validate"
+    rate = "60/hour"
+
+
+class InvitationConsumeRateThrottle(AnonRateThrottle):
+    # Saving a password is a sensitive state-changing operation. Validation
+    # traffic must not make the one-time link impossible to consume.
+    scope = "workshop_invitation_consume"
+    rate = "10/hour"
 
 
 
@@ -103,6 +130,14 @@ class SecureTokenRefreshView(TokenRefreshView):
             return Response({"detail": "Invalid or expired session."}, status=401)
         if not user or not user.has_usable_password() or not user_can_sign_in(user):
             return Response({"detail": "Account access is no longer active."}, status=401)
+        # TokenRefreshSerializer does not authenticate the user through
+        # JWTAuthentication.get_user(), so enforce password-change revocation
+        # here, before minting an access token from a previously issued refresh.
+        if api_settings.CHECK_REVOKE_TOKEN and not constant_time_compare(
+            str(refresh.get(api_settings.REVOKE_TOKEN_CLAIM, "")),
+            get_md5_hash_password(user.password),
+        ):
+            return Response({"code": "SESSION_REVOKED", "detail": "Invalid or expired session."}, status=401)
         return super().post(request, *args, **kwargs)
 
 
@@ -160,9 +195,9 @@ class ForgotPasswordView(APIView):
 
         # Preserve legacy owner/platform email recovery. Staff onboarding and
         # linked employee accounts recover through workshop-owned WhatsApp.
-        user = User.objects.filter(email__iexact=data["email"], is_active=True).first()
+        user = unique_active_email_user(data["email"])
         from apps.accounts.permissions import is_company_owner
-        if user and (is_platform_account(user) or is_company_owner(user)):
+        if email_delivery_mode() != "disabled" and user and (is_platform_account(user) or is_company_owner(user)):
             uid = urlsafe_base64_encode(force_bytes(user.pk))
             token = default_token_generator.make_token(user)
             reset_url = password_action_url(request, user, uid, token)
@@ -173,6 +208,38 @@ class ForgotPasswordView(APIView):
                 action_url=reset_url, action_label="Reset password",
             )
         return Response(generic)
+
+class ResetPasswordLinkValidationView(APIView):
+    """Verify possession of a recovery token before showing a password form.
+
+    No bearer session is issued and the endpoint never reveals account data.
+    Legacy email+token links remain supported alongside uid+token links.
+    """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [RecoveryRateThrottle]
+
+    def post(self, request):
+        uid = request.data.get("uid")
+        email = request.data.get("email")
+        token = request.data.get("token")
+        invalid = {"code": "INVALID_RESET_LINK", "message": "This link is invalid or expired."}
+        if not isinstance(token, str) or not token or len(token) > 256:
+            return Response(invalid, status=400)
+        try:
+            if isinstance(uid, str) and uid:
+                ident = urlsafe_base64_decode(uid).decode()
+                user = User.objects.get(pk=ident, is_active=True)
+            elif isinstance(email, str) and email:
+                user = unique_active_email_user(email)
+            else:
+                user = None
+        except (ValueError, TypeError, User.DoesNotExist, UnicodeError):
+            user = None
+        if not user or is_platform_account(user) or not default_token_generator.check_token(user, token):
+            return Response(invalid, status=400)
+        return Response({"valid": True})
+
 
 class ResetPasswordView(APIView):
     # Public auth routes must ignore stale Authorization headers from clients.
@@ -232,9 +299,9 @@ class MagicLinkRequestView(APIView):
     def post(self, request):
         serializer = MagicLinkRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = User.objects.filter(email__iexact=serializer.validated_data["email"], is_active=True).first()
+        user = unique_active_email_user(serializer.validated_data["email"])
         # Public recovery responses must not reveal whether an account exists.
-        if user and user_can_sign_in(user):
+        if email_delivery_mode() != "disabled" and user and user_can_sign_in(user):
             raw_token = MagicLink.issue(user)
             url = magic_action_url(request, user, raw_token)
             queue_email(
@@ -291,6 +358,12 @@ class PublicWorkshopSignupView(APIView):
         serializer = PublicWorkshopSignupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        # Do not create an unusable account when email delivery is disabled.
+        if not data.get("password") and email_delivery_mode() == "disabled":
+            return Response({
+                "code": "EMAIL_DELIVERY_UNAVAILABLE",
+                "message": "Password setup email is unavailable. Choose a password to register.",
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         # A login slug must fit one DNS label so signup never creates an
         # unrouteable default address. Existing website aliases reserve names
@@ -424,20 +497,30 @@ class StaffInvitationValidationView(APIView):
     # Public auth routes must ignore stale Authorization headers from clients.
     authentication_classes = []
     permission_classes = [AllowAny]
-    throttle_classes = [RecoveryRateThrottle]
+    throttle_classes = [InvitationValidateRateThrottle]
 
     def post(self, request):
         record = resolve_invitation(request.data.get("token"))
         if not record:
             return Response({"valid":False,"message":"Invalid or expired setup link."}, status=400)
-        return Response({"valid":True,"purpose":record.purpose,"expiresAt":record.expires_at})
+        # A valid bearer invitation may identify its audience so the UI can
+        # label owner onboarding correctly, without disclosing personal data.
+        account_type = (
+            "owner" if record.user.company.owner_id == record.user_id else "staff"
+        )
+        return Response({
+            "valid": True,
+            "purpose": record.purpose,
+            "expiresAt": record.expires_at,
+            "accountType": account_type,
+        })
 
 
 class StaffInvitationConsumeView(APIView):
     # Public auth routes must ignore stale Authorization headers from clients.
     authentication_classes = []
     permission_classes = [AllowAny]
-    throttle_classes = [RecoveryRateThrottle]
+    throttle_classes = [InvitationConsumeRateThrottle]
 
     def post(self, request):
         from django.contrib.auth.password_validation import validate_password
@@ -479,6 +562,8 @@ class SetupPasswordView(APIView):
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        if not serializer.validated_data.get("uid"):
+            return Response({"message": "Invalid or expired setup link."}, status=400)
 
         try:
             user_id = urlsafe_base64_decode(serializer.validated_data["uid"]).decode()
