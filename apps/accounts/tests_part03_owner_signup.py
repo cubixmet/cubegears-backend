@@ -1,6 +1,7 @@
 """Part 03: owner password signup and refresh-token tenant access guards."""
 
 from django.test import TestCase, override_settings
+from django.core.cache import cache
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User, StaffPasswordInvitation
@@ -15,6 +16,9 @@ from apps.roles.models import Role
 )
 class OwnerPasswordSignupTests(TestCase):
     def setUp(self):
+        # Anonymous request throttles use a shared cache across TestCase methods.
+        # Isolate tests without weakening production signup rate limits.
+        cache.clear()
         self.client = APIClient()
 
     def test_owner_creates_workshop_with_mobile_and_password_without_otp(self):
@@ -38,6 +42,52 @@ class OwnerPasswordSignupTests(TestCase):
         }, format="json")
         self.assertEqual(logged.status_code, 200, logged.data)
         self.assertIn("refresh", logged.data)
+
+    def test_signup_rejects_registered_mobile_without_creating_another_workshop(self):
+        first = self.client.post("/api/v1/auth/signup", {
+            "workshop_name": "Existing Mobile Garage",
+            "owner_name": "Original Owner",
+            "mobile": "+919848484852",
+            "email": "first-owner@example.test",
+            "password": "StrongDirectPass2026!",
+            "confirm_password": "StrongDirectPass2026!",
+        }, format="json")
+        self.assertEqual(first.status_code, 201, first.data)
+        initial_companies = Company.objects.count()
+        initial_users = User.objects.count()
+
+        second = self.client.post("/api/v1/auth/signup", {
+            "workshop_name": "Another Mobile Garage",
+            "owner_name": "Second Owner",
+            "mobile": "+91 98484 84852",
+            "email": "second-owner@example.test",
+            "password": "AnotherStrongPass2026!",
+            "confirm_password": "AnotherStrongPass2026!",
+        }, format="json")
+        self.assertEqual(second.status_code, 400, second.data)
+        self.assertIn("mobile", second.data)
+        self.assertIn("already registered", str(second.data["mobile"]).lower())
+        self.assertEqual(Company.objects.count(), initial_companies)
+        self.assertEqual(User.objects.count(), initial_users)
+        self.assertFalse(User.objects.filter(email="second-owner@example.test").exists())
+
+    def test_signup_rejects_existing_company_contact_number_without_user(self):
+        Company.objects.create(
+            name="Legacy Registered Workshop",
+            slug="legacy-registered-phone",
+            phone="+919848484853",
+        )
+        reply = self.client.post("/api/v1/auth/signup", {
+            "workshop_name": "Duplicate Company Phone Garage",
+            "owner_name": "Owner",
+            "mobile": "+919848484853",
+            "email": "new-owner@example.test",
+            "password": "StrongDirectPass2026!",
+            "confirm_password": "StrongDirectPass2026!",
+        }, format="json")
+        self.assertEqual(reply.status_code, 400, reply.data)
+        self.assertIn("mobile", reply.data)
+        self.assertFalse(Company.objects.filter(name="Duplicate Company Phone Garage").exists())
 
     def test_signup_password_confirmation_and_strength_enforced_before_writes(self):
         for password, confirm in [
