@@ -26,8 +26,12 @@ class WhatsAppSettingsView(APIView):
             "messagingMode": "manual",
             "configured": True,
             "connected": False,
+            # These two fields are for former automatic provider sending,
+            # not the manual click-to-chat feature.
             "notificationsEnabled": False,
             "sendEnabled": False,
+            "manualEnabled": True,
+            "manualStatus": "enabled",
             "eventNames": [],
             "events": {},
             "templates": [],
@@ -35,10 +39,19 @@ class WhatsAppSettingsView(APIView):
 
     def patch(self, request):
         _manage(request)
-        if request.data.get("messagingMode", "manual") != "manual" or request.data.get("notificationsEnabled", False):
-            return Response({"message": "Only manual WhatsApp sharing is supported."}, status=400)
+        if not isinstance(request.data, dict):
+            return Response({"message": "Provide a settings object."}, status=400)
+        allowed = {"manualEnabled", "messagingMode", "notificationsEnabled"}
+        if set(request.data) - allowed:
+            return Response({"message": "Only manual WhatsApp sharing is available."}, status=400)
+        if (request.data.get("messagingMode", "manual") != "manual"
+                or request.data.get("notificationsEnabled", False) is not False
+                or ("manualEnabled" in request.data and request.data["manualEnabled"] is not True)):
+            return Response({
+                "message": "Manual WhatsApp sharing is always enabled. Automatic sending is unavailable."
+            }, status=400)
+        # Read-only compatibility for older clients; no enable/disable switch.
         return self.get(request)
-
 
 class WhatsAppLogsView(APIView):
     permission_classes = [IsAuthenticated]

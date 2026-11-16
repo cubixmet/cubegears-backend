@@ -9,6 +9,7 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.exceptions import NotFound
 from django.utils.dateparse import parse_datetime
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import decorators,response,status
 from rest_framework.exceptions import ValidationError
@@ -24,6 +25,8 @@ from .complaint_status import sync_complaint_status, manual_complaint_status, un
 from .india_gst import gst_context, calculate_tax, gst_rate
 from apps.invoices.gst_rate_options import find_gst_choice
 from apps.notifications.job_events import notify_job_event
+
+POSTED_JOB_INVOICE_STATUSES = ("Finalized", "Paid", "Issued", "Partially Paid", "Overdue")
 
 def _same_quick_create_phone(stored, supplied):
     """Allow verified +91 normalization of legacy 10-digit Indian contacts only."""
@@ -72,6 +75,7 @@ class JobViewSet(CompanyScopedModelViewSet):
         "activity": "jobs.view",
         "issue_part": ["jobs.edit", "stock.edit"],
         "cost_summary": ["jobs.view", "payroll.view", "expenses.view", "stock.view"],
+        "billing_summary": ["jobs.view", "invoices.view"],
     }
     def get_queryset(self):
         qs=super().get_queryset(); st=self.request.query_params.get("status")
@@ -145,6 +149,67 @@ class JobViewSet(CompanyScopedModelViewSet):
             "unapprovedMechanicWork": pending_mechanic,
             "partsAtCurrentCost": used_current_cost,
             "note": "Total is recorded direct cost, excludes unallocated daily wages and workshop overhead.",
+        })
+
+    @decorators.action(detail=True, methods=["get"], url_path="billing-summary")
+    def billing_summary(self, request, pk=None):
+        """Posted invoice totals and provisional Job Card selling (read-only).
+
+        Drafts and cancelled invoices never become income, payments or dues.
+        Payments already applied to Invoice.paid are not counted a second time.
+        This endpoint does not expose internal cost data to invoice-only staff.
+        """
+        from apps.invoices.job_draft import job_selling_before_gst, suggested_job_invoice
+        from apps.invoices.models import Invoice
+
+        job = self.get_object()
+        # Do not expose another branch's invoices to a staff member even if
+        # the caller knows its UUID. Owners can inspect historical branchless jobs.
+        from django.http import Http404
+        from apps.accounts.permissions import is_company_owner
+        from apps.accounts.branch_access import authorized_branch_ids
+        if not is_company_owner(request.user) and job.branch_id not in authorized_branch_ids(request.user):
+            raise Http404
+        invoices = list(
+            Invoice.objects.filter(company=job.company, customer_id=job.customer_id, kind="invoice")
+            .filter(Q(job=job) | Q(job__isnull=True, source_job_id=str(job.pk)))
+            .exclude(status__in=["Cancelled", "Canceled", "Void", "Voided"])
+            .order_by("-created_at", "-pk")
+            .distinct()
+        )
+        posted = [row for row in invoices
+                  if row.finalized_at is not None and row.status in POSTED_JOB_INVOICE_STATUSES]
+        zero = Decimal("0.00")
+        def amount(value):
+            return str(value.quantize(Decimal("0.01")))
+
+        total = sum((row.total for row in posted), zero)
+        taxable = sum((row.taxable for row in posted), zero)
+        received = sum((row.paid for row in posted), zero)
+        outstanding = sum((row.balance for row in posted), zero)
+        selected = posted[0] if posted else (invoices[0] if invoices else None)
+        draft = selected if selected and selected.status == "Draft" else None
+        work_selling = job_selling_before_gst(suggested_job_invoice(job)["items"]) if not selected else None
+        return response.Response({
+            "jobId": str(job.pk),
+            "customerId": str(job.customer_id),
+            "vehicleId": str(job.vehicle_id),
+            "invoiceCount": len(invoices),
+            "postedInvoiceCount": len(posted),
+            "draftInvoiceCount": sum(1 for row in invoices if row.status == "Draft"),
+            "primaryInvoiceId": str(selected.pk) if selected else None,
+            "primaryInvoiceNumber": selected.number if selected else None,
+            "primaryInvoiceStatus": selected.status if selected else None,
+            "postedInvoiceIds": [str(row.pk) for row in posted],
+            "sellingBeforeGST": amount(taxable) if posted else None,
+            "invoiceTotal": amount(total) if posted else None,
+            "draftSellingBeforeGST": amount(draft.taxable) if draft else None,
+            "draftInvoiceTotal": amount(draft.total) if draft else None,
+            "workSellingBeforeGST": amount(work_selling) if work_selling is not None else None,
+            "paid": amount(received) if posted else None,
+            "outstanding": amount(outstanding) if posted else None,
+            "source": "finalized_invoices" if posted else "not_invoiced",
+            "note": "Amounts come from posted invoices. Estimates, drafts and cancelled invoices are excluded.",
         })
 
     def _guard_active_timers(self,job,next_status):
@@ -262,6 +327,10 @@ class JobViewSet(CompanyScopedModelViewSet):
             qc_data = serializer.validated_data["qc"]
             if not isinstance(qc_data, dict):
                 raise ValidationError({"qc": "Quality Check must be an object."})
+            if "qc" in (job.workflow_progress or {}).get("skipped", []):
+                raise ValidationError({"qc": "Skipped QC records are read-only."})
+            if qc_data.get("status") == "Skipped":
+                raise ValidationError({"qc": "Use Skip QC to record a skip."})
             inspector_name = str(getattr(self.request.user, "name", "") or "").strip()
             if not inspector_name:
                 raise ValidationError({"qc": "Your login account needs a name to save QC."})
@@ -681,6 +750,7 @@ class JobViewSet(CompanyScopedModelViewSet):
             raise ValidationError({"stage": "This Job Card stage is already completed."})
         if stage != state["current"]:
             raise ValidationError({"stage": f"Complete {state['current']} before {stage}."})
+        skip_qc = stage == "qc" and request.data.get("skipQC") is True
 
         if stage == "overview":
             if not job.customer_id or not job.vehicle_id:
@@ -741,18 +811,28 @@ class JobViewSet(CompanyScopedModelViewSet):
             self._guard_active_timers(job, "QC")
         elif stage == "qc":
             qc = job.qc or {}
-            if qc.get("status") != "Pass":
-                raise ValidationError({"stage":"Quality Check must pass before billing."})
             checklist = qc.get("checklist") or []
-            if not checklist or any(item.get("status") != "Pass" for item in checklist):
-                raise ValidationError({"stage":"Every Quality Check item must be marked Pass."})
+            if skip_qc:
+                reason = request.data.get("reason")
+                if not isinstance(reason, str) or not 3 <= len(reason.strip()) <= 160:
+                    raise ValidationError({"reason": "Enter a skip reason between 3 and 160 characters."})
+                if qc.get("status") in {"Fail", "Failed", "Rework Required"} or any(
+                    isinstance(item, dict) and item.get("status") == "Fail" for item in checklist
+                ):
+                    raise ValidationError({"qc": "Resolve failed checks before proceeding to billing."})
+                skip_reason = reason.strip()
+            else:
+                if qc.get("status") != "Pass":
+                    raise ValidationError({"stage":"Quality Check must pass before billing."})
+                if not checklist or any(not isinstance(item, dict) or item.get("status") != "Pass" for item in checklist):
+                    raise ValidationError({"stage":"Every Quality Check item must be marked Pass."})
             self._guard_active_timers(job, "Ready for Delivery")
         elif stage == "invoice":
             from apps.invoices.models import Invoice
             if not Invoice.objects.filter(
-                company=job.company, job=job, kind="invoice",
-                status__in=["Finalized","Paid"],
-            ).exists():
+                company=job.company, customer_id=job.customer_id, kind="invoice",
+                status__in=POSTED_JOB_INVOICE_STATUSES, finalized_at__isnull=False,
+            ).filter(Q(job=job) | Q(job__isnull=True, source_job_id=str(job.pk))).exists():
                 raise ValidationError({"stage":"Finalize a linked invoice before completing delivery."})
             # Save handover metadata with the stage transition in one transaction.
             handover = request.data.get("delivery")
@@ -804,16 +884,32 @@ class JobViewSet(CompanyScopedModelViewSet):
         if stage == "invoice":
             job.delivered_at = timezone.now()
         fields = ["workflow_progress", "status", "delivered_at", "updated_at"]
+        if skip_qc:
+            skipped_at = progress["lastCompletedAt"]
+            skipped = set(progress.get("skipped") or []) | {"qc"}
+            progress["skipped"] = [name for name in STAGES if name in skipped]
+            progress["skipDetails"] = {**(progress.get("skipDetails") or {}), "qc": {
+                "reason": skip_reason, "skippedAt": skipped_at, "skippedById": str(request.user.pk),
+            }}
+            progress["lastSkippedAt"] = skipped_at
+            job.qc = {**qc, "status": "Skipped", "skipReason": skip_reason}
+            fields.append("qc")
         if stage == "estimate":
             fields.append("estimate_total")
         if sync_complaint_status(job):
             fields.append("complaints")
         job.save(update_fields=fields)
+        metadata = {"stage": stage}
+        if stage == "estimate":
+            metadata["estimateApproval"] = estimate_approval
+        if skip_qc:
+            metadata.update(progress["skipDetails"]["qc"])
         activity = JobActivity.objects.create(
             company=job.company,branch=job.branch,job=job,actor=request.user,
-            event="Workflow Stage Completed",description=f"{stage} completed",
+            event="Quality Check Skipped" if skip_qc else "Workflow Stage Completed",
+            description=skip_reason if skip_qc else f"{stage} completed",
             from_status=old_status,to_status=job.status,
-            metadata={"stage": stage, **({"estimateApproval": estimate_approval} if stage == "estimate" else {})},
+            metadata=metadata,
         )
         if old_status != job.status:
             notify_job_event(job,

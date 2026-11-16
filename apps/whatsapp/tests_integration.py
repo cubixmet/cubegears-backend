@@ -1,4 +1,6 @@
 """Manual-only WhatsApp sharing and historical-data regression coverage."""
+from urllib.parse import parse_qs, urlsplit
+
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
@@ -6,6 +8,7 @@ from apps.accounts.models import User
 from apps.companies.models import Company
 from apps.customers.models import Customer
 from apps.roles.models import Role
+from apps.saas.models import CompanySetting
 from apps.whatsapp.models import (
     WhatsAppBusinessConnection, WhatsAppMessageTemplate,
     WhatsAppNotificationLog, CustomerNotificationPreference,
@@ -45,6 +48,73 @@ class WhatsAppManualOnlyTests(TestCase):
                 {}, format="json").status_code, 404)
         self.assertIn(self.public.get("/api/v1/whatsapp/settings").status_code, (401, 403))
 
+    def test_manual_sharing_is_permanently_enabled_and_has_no_disable_option(self):
+        settings_url = "/api/v1/whatsapp/settings"
+        share_url = "/api/v1/whatsapp/manual-share"
+
+        initial = self.client.get(settings_url)
+        self.assertEqual(initial.status_code, 200, initial.data)
+        self.assertTrue(initial.data["manualEnabled"])
+        self.assertEqual(initial.data["manualStatus"], "enabled")
+        self.assertFalse(initial.data["sendEnabled"])
+        self.assertFalse(initial.data["notificationsEnabled"])
+        self.assertEqual(initial.data["messagingMode"], "manual")
+
+        for values in (
+            {"manualEnabled": False},
+            {"messagingMode": "automatic"},
+            {"notificationsEnabled": True},
+        ):
+            result = self.client.patch(settings_url, values, format="json")
+            self.assertEqual(result.status_code, 400, result.data)
+
+        same = self.client.patch(
+            settings_url, {"manualEnabled": True}, format="json"
+        )
+        self.assertEqual(same.status_code, 200, same.data)
+        self.assertTrue(same.data["manualEnabled"])
+
+        # Even old disabled settings cannot disable manual Click-to-Chat.
+        CompanySetting.objects.create(
+            company=self.company, category="whatsapp_manual",
+            data={"enabled": False},
+        )
+        latest = self.client.get(settings_url)
+        self.assertTrue(latest.data["manualEnabled"])
+        draft = self.client.post(share_url, {
+            "targetType": "customer",
+            "targetId": str(self.customer.pk),
+        }, format="json")
+        self.assertEqual(draft.status_code, 200, draft.data)
+        self.assertTrue(draft.data["url"].startswith("https://wa.me/"))
+        self.assertEqual(draft.data["status"], "manual_prepared")
+
+    def test_legacy_automatic_whatsapp_flags_cannot_be_enabled(self):
+        # Historical settings may contain true. The API must not report an
+        # automatic WhatsApp capability that no longer exists.
+        CompanySetting.objects.create(
+            company=self.company, category="notifications",
+            data={"whatsapp": True},
+        )
+        CompanySetting.objects.create(
+            company=self.company, category="integrations",
+            data={"whatsappEnabled": True},
+        )
+        root = self.client.get("/api/v1/settings")
+        self.assertEqual(root.status_code, 200, root.data)
+        self.assertFalse(root.data["notifications"]["whatsapp"])
+        self.assertFalse(root.data["integrations"]["whatsappEnabled"])
+        for category, payload in (
+            ("notifications", {"whatsapp": True}),
+            ("integrations", {"whatsappEnabled": True}),
+        ):
+            url = "/api/v1/settings/" + category
+            self.assertFalse(self.client.get(url).data[
+                "whatsapp" if category == "notifications" else "whatsappEnabled"
+            ])
+            result = self.client.put(url, payload, format="json")
+            self.assertEqual(result.status_code, 400, result.data)
+
     def test_old_cloud_configuration_cannot_trigger_automatic_delivery(self):
         WhatsAppBusinessConnection.objects.create(
             company=self.company, messaging_mode="automatic", connected=True,
@@ -76,6 +146,37 @@ class WhatsAppManualOnlyTests(TestCase):
             WhatsAppNotificationLog.objects.get(company=self.company).status,
             "manual_prepared",
         )
+
+    @override_settings(DEBUG=True, CUSTOMER_PORTAL_BASE_URL="http://localhost:5174/access")
+    def test_manual_share_uses_configured_development_port_for_preview_and_draft(self):
+        url = "/api/v1/whatsapp/manual-share"
+        payload = {"targetType": "customer", "targetId": str(self.customer.pk)}
+        initial = self.client.post(url, payload, format="json")
+        self.assertEqual(initial.status_code, 200, initial.data)
+        default_link = initial.data["preview"].rsplit(" ", 1)[-1]
+        expected_link = default_link.replace(":5174/", ":4190/")
+
+        result = self.client.post(url, {**payload,
+            "customerWebsiteDevOrigin": "http://127.0.0.1:4190",
+        }, format="json")
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertTrue(expected_link.startswith("http://whatsapp-tenant-test.localhost:4190/access/"))
+        self.assertTrue(result.data["preview"].endswith(expected_link))
+        self.assertEqual(parse_qs(urlsplit(result.data["url"]).query)["text"], [result.data["preview"]])
+
+        for invalid in ("https://example.test", "http://localhost:4190/access", "http://localhost:70000"):
+            result = self.client.post(url, {**payload, "customerWebsiteDevOrigin": invalid}, format="json")
+            self.assertEqual(result.status_code, 400, result.data)
+
+    @override_settings(DEBUG=False, CUSTOMER_PORTAL_BASE_URL="https://customer.example.test/access")
+    def test_production_manual_share_ignores_a_development_origin(self):
+        result = self.client.post("/api/v1/whatsapp/manual-share", {
+            "targetType": "customer", "targetId": str(self.customer.pk),
+            "customerWebsiteDevOrigin": "http://localhost:4190",
+        }, format="json", secure=True)
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(urlsplit(result.data["preview"].rsplit(" ", 1)[-1]).scheme, "https")
+        self.assertNotIn("localhost", result.data["preview"])
 
     def test_invalid_record_id_is_a_safe_400_not_internal_server_error(self):
         for value in ("invalid-id", None, "<script>alert(1)</script>"):

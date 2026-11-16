@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from .models import Customer, CustomerActivity, CustomerReminder
 from apps.branches.models import Branch
+from common.phone_numbers import normalize_contact_phone
 
 class CustomerSerializer(serializers.ModelSerializer):
     branchName = serializers.CharField(source="branch.name", read_only=True)
@@ -21,18 +22,52 @@ class CustomerSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Customer name is required.")
         return value
 
+    def validate_documents(self, value):
+        """Store only small reference metadata, never uploaded file data."""
+        if not isinstance(value, list) or len(value) > 100:
+            raise serializers.ValidationError("Provide up to 100 document references.")
+        allowed = ("id", "name", "type", "vehicleReg", "expiryDate",
+                   "status", "fileName", "uploadedDate")
+        clean = []
+        for document in value:
+            if not isinstance(document, dict):
+                raise serializers.ValidationError("Each document reference must be an object.")
+            if not str(document.get("name") or "").strip():
+                raise serializers.ValidationError("Document name is required.")
+            row = {}
+            for key in allowed:
+                data = str(document.get(key) or "").strip()
+                if len(data) > (180 if key in ("name", "fileName") else 100):
+                    raise serializers.ValidationError(f"Document {key} is too long.")
+                row[key] = data
+            clean.append(row)
+        return clean
+
     def validate_phone(self, value):
-        value = value.strip()
-        if not value:
-            raise serializers.ValidationError("Customer contact number is required.")
-        return value
+        return normalize_contact_phone(value, required=True)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # One phone contact: the same number is used for manual WhatsApp
+        # sharing. Old records remain untouched until the phone is updated.
+        if "phone" in attrs:
+            attrs["whatsapp"] = attrs["phone"]
+        elif "whatsapp" in attrs:
+            # Separate WhatsApp numbers are no longer accepted; keep the
+            # existing saved phone when this PATCH does not update phone.
+            attrs["whatsapp"] = getattr(self.instance, "phone", "")
+        return attrs
 
     def validate_branch(self, branch):
         request = self.context.get("request")
-        if branch and (
+        from apps.accounts.branch_access import authorized_branch_ids
+        if branch is None:
+            raise serializers.ValidationError("Select an authorized active branch.")
+        if (
             branch.company_id != request.user.company_id or not branch.is_active
+            or branch.pk not in authorized_branch_ids(request.user)
         ):
-            raise serializers.ValidationError("Select an active branch in your company.")
+            raise serializers.ValidationError("You may assign customers only to an authorized active branch.")
         return branch
 
 class CustomerActivitySerializer(serializers.ModelSerializer):

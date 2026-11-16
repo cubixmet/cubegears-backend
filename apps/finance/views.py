@@ -15,6 +15,8 @@ from apps.inventory.models import (
 )
 from apps.payments.models import Payment
 from apps.expenses.models import Expense
+from apps.finance.channels import account_channel
+from common.record_references import record_label, record_reference, record_uuid
 
 CENT = Decimal("0.01")
 
@@ -100,7 +102,7 @@ def accounts_summary(company_id):
             "bankName": acc.bank_name, "accountNumber": mask_account_number(acc.account_number),
             "ifsc": acc.ifsc, "branchName": acc.branch_name,
             "openingBalance": str(acc.opening_balance), "currentBalance": str(bal),
-            "isActive": acc.is_active,
+            "isActive": acc.is_active, "isDefaultPayment": acc.is_default_payment,
         })
         # Preserve legacy account IDs; all digital money is shown under Bank
         # in the new two-channel Finance UI, and only physical notes are Cash.
@@ -323,7 +325,7 @@ class FinanceAccountCollection(FinanceBalanceRedactionMixin, APIView):
                 "openingBalance": str(acc.opening_balance),
                 "openingDate": acc.opening_date.isoformat() if acc.opening_date else None,
                 "currentBalance": str(bal), "isActive": acc.is_active,
-                "description": acc.description,
+                "isDefaultPayment": acc.is_default_payment, "description": acc.description,
             })
         return Response(result)
 
@@ -351,7 +353,8 @@ class FinanceAccountCollection(FinanceBalanceRedactionMixin, APIView):
             is_active=True, created_by=request.user,
         )
         return Response({"id": str(acc.pk), "name": acc.name, "kind": acc.kind,
-                         "currentBalance": str(acc.opening_balance), "isActive": True}, status=201)
+                         "currentBalance": str(acc.opening_balance), "isActive": True,
+                         "isDefaultPayment": False}, status=201)
 
 
 class FinanceAccountDetail(FinanceBalanceRedactionMixin, APIView):
@@ -389,7 +392,8 @@ class FinanceAccountDetail(FinanceBalanceRedactionMixin, APIView):
             "bankName": acc.bank_name, "accountNumber": mask_account_number(acc.account_number),
             "ifsc": acc.ifsc, "branchName": acc.branch_name,
             "openingBalance": str(acc.opening_balance), "currentBalance": str(bal),
-            "isActive": acc.is_active, "description": acc.description,
+            "isActive": acc.is_active, "isDefaultPayment": acc.is_default_payment,
+            "description": acc.description,
             "openingDate": acc.opening_date.isoformat() if acc.opening_date else None,
             "ledger": list(reversed(ledger)),
         })
@@ -428,8 +432,29 @@ class FinanceAccountDetail(FinanceBalanceRedactionMixin, APIView):
             if not isinstance(d["isActive"], bool):
                 raise ValidationError({"isActive": "Expected true or false."})
             acc.is_active = d["isActive"]
+            if not acc.is_active:
+                acc.is_default_payment = False
+
+        if "isDefaultPayment" in d:
+            preference = d["isDefaultPayment"]
+            if not isinstance(preference, bool):
+                raise ValidationError({"isDefaultPayment": "Expected true or false."})
+            if preference:
+                channel = account_channel(acc.kind)
+                if not acc.is_active or channel is None:
+                    raise ValidationError({"isDefaultPayment": "Only active Cash / Bank accounts may be default payment accounts."})
+                # A company can have one default physical Cash source and one
+                # default Bank/UPI source. Lock all candidates to serialize
+                # updates and avoid silently charging a different account.
+                account_kinds = ["Cash"] if channel == "Cash" else ["Bank", "UPI", "Wallet"]
+                others = WorkshopFinancialAccount.objects.select_for_update().filter(
+                    company=request.user.company, kind__in=account_kinds,
+                ).exclude(pk=acc.pk)
+                others.filter(is_default_payment=True).update(is_default_payment=False)
+            acc.is_default_payment = preference
         acc.save()
-        return Response({"id": str(acc.pk), "name": acc.name, "isActive": acc.is_active})
+        return Response({"id": str(acc.pk), "name": acc.name,
+                         "isActive": acc.is_active, "isDefaultPayment": acc.is_default_payment})
 
 
 class FinanceAdjustment(FinanceBalanceRedactionMixin, APIView):
@@ -590,7 +615,17 @@ class FinanceLedger(FinanceBalanceRedactionMixin, APIView):
             qs = qs.filter(posted_at__date__lte=date_to)
         search = request.query_params.get("q", "").strip()
         if search:
-            qs = qs.filter(Q(reference__icontains=search) | Q(source_key__icontains=search))
+            terms = search.rsplit(maxsplit=1)
+            try:
+                record_id = record_uuid(terms[-1])
+            except ValueError:
+                record_id = None
+            matches = Q(reference__icontains=search) | Q(source_key__icontains=search)
+            if record_id and len(terms) == 1:
+                matches |= Q(pk=record_id) | Q(reference__icontains=str(record_id)) | Q(source_key__icontains=str(record_id))
+            elif record_id:
+                matches |= Q(reference__icontains=f"{terms[0]} {record_id}")
+            qs = qs.filter(matches)
 
         # CSV export
         if request.query_params.get("export") == "csv":
@@ -662,7 +697,7 @@ class FinanceLedger(FinanceBalanceRedactionMixin, APIView):
                 cell(entry.entry_type),
                 cell(str(entry.amount) if entry.amount > 0 else "0.00"),
                 cell(str(-entry.amount) if entry.amount < 0 else "0.00"),
-                cell(entry.reference),
+                cell(record_label(entry.reference) or record_reference(entry.pk)),
                 cell(entry.created_by.name if entry.created_by else ""),
             ])
         table = Table(rows, repeatRows=1, colWidths=[65, 110, 95, 64, 64, 230, 105])
@@ -692,14 +727,14 @@ class FinanceLedger(FinanceBalanceRedactionMixin, APIView):
         response = HttpResponse(content_type="text/csv")
         response["Content-Disposition"] = 'attachment; filename="transactions.csv"'
         writer = csv.writer(response)
-        writer.writerow(["Date", "Account", "Type", "Credit", "Debit", "Reference", "Source Key", "Created By"])
+        writer.writerow(["Date", "Account", "Type", "Credit", "Debit", "Reference", "Transaction Reference", "Created By"])
         for entry in qs.order_by("-posted_at")[:5000]:
             credit = str(entry.amount) if entry.amount > 0 else "0.00"
             debit = str(abs(entry.amount)) if entry.amount < 0 else "0.00"
             writer.writerow([
                 entry.posted_at.date().isoformat(), csv_safe(entry.account.name),
-                csv_safe(entry.entry_type), credit, debit, csv_safe(entry.reference),
-                csv_safe(entry.source_key), csv_safe(entry.created_by.name if entry.created_by else ""),
+                csv_safe(entry.entry_type), credit, debit, csv_safe(record_label(entry.reference)),
+                record_reference(entry.pk), csv_safe(entry.created_by.name if entry.created_by else ""),
             ])
         return response
 

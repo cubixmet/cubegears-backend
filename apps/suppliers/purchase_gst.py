@@ -3,11 +3,11 @@
 GST rates are entered as combined percentages; component rates are derived.
 No historical purchase, stock record or tax classification is modified.
 """
-import re
 from decimal import Decimal, ROUND_HALF_UP
 
 from rest_framework.exceptions import ValidationError
 from apps.jobs.india_gst import state_code, calculate_tax
+from .gstin import normalized_supplier_gstin, supplier_gstin_error
 
 CENT = Decimal("0.01")
 UTGST_CODES = frozenset({"04", "26", "31", "35", "38"})
@@ -15,16 +15,24 @@ TREATMENTS = frozenset({"taxable", "exempt", "nil_rated", "zero_rated", "non_gst
 
 
 def purchase_gst_context(supplier, place_of_supply):
-    if not place_of_supply:
-        return {"taxMode": "legacy", "placeOfSupply": "", "supplierStateCode": ""}
-    pos = state_code(str(place_of_supply))
-    if not pos:
+    """Unregistered suppliers can sell without GST or Place of Supply.
+
+    Keep the legacy no-POS behavior for older registered-client requests, but
+    never apply that legacy tax path to unregistered suppliers or bad GSTINs.
+    The current UI always supplies buyer state when the supplier is registered.
+    """
+    gstin = normalized_supplier_gstin(supplier.gstin)
+    if gstin:
+        problem = supplier_gstin_error(gstin)
+        if problem:
+            raise ValidationError({"supplierId": problem + " Edit Supplier Details before posting a GST purchase."})
+    pos = state_code(str(place_of_supply)) if place_of_supply else ""
+    if place_of_supply and not pos:
         raise ValidationError({"placeOfSupply": "Select a valid Indian place-of-supply state."})
-    gstin = str(supplier.gstin or "").strip().upper()
     if not gstin:
         return {"taxMode": "unregistered", "placeOfSupply": pos, "supplierStateCode": ""}
-    if not re.fullmatch(r"[0-9]{2}[A-Z0-9]{13}", gstin) or not state_code(gstin[:2]):
-        raise ValidationError({"supplierId": "Verify the supplier GSTIN before charging GST."})
+    if not pos:
+        return {"taxMode": "legacy", "placeOfSupply": "", "supplierStateCode": ""}
     return {
         "taxMode": "cgst_sgst" if gstin[:2] == pos else "igst",
         "placeOfSupply": pos,
