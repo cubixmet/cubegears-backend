@@ -50,6 +50,86 @@ class ManualComplaintTests(TestCase):
             {"status": status, "notes": notes, **kwargs}, format="json",
         )
 
+    def edit(self, key="CMP-1", description="Brake noise in reverse", original="Brake noise"):
+        return self.client.patch(self.url(f"complaints/{key}"), {
+            "description": description, "originalDescription": original,
+        }, format="json")
+
+    def test_wording_edit_preserves_review_and_rejects_a_stale_draft(self):
+        self.assertEqual(self.update(status="Resolved", notes="Brake repaired").status_code, 200)
+        self.job.refresh_from_db()
+        previous_rows = self.job.complaints
+        result = self.edit()
+        self.assertEqual(result.status_code, 200, result.data)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.complaints[0], {
+            **previous_rows[0], "description": "Brake noise in reverse", "wording": "Brake noise in reverse",
+        })
+        self.assertEqual(self.job.complaints[1], previous_rows[1])
+        self.assertEqual(self.edit().status_code, 200)
+        self.assertEqual(self.edit(description="Old edit").status_code, 409)
+        self.assertEqual(JobActivity.objects.filter(job=self.job, event="Customer Complaint Edited").count(), 1)
+
+    def test_wording_edit_accepts_legacy_reference_and_locks_delivered_jobs(self):
+        self.job.complaints[0].pop("id")
+        self.job.save(update_fields=["complaints"])
+        self.assertEqual(self.edit("row-0", description="  ").status_code, 400)
+        self.assertEqual(self.edit("row-0").status_code, 200)
+        self.assertEqual(self.edit("row-2").status_code, 404)
+        Job.objects.filter(pk=self.job.pk).update(status="Delivered")
+        self.assertEqual(self.edit("row-0", "Still noisy", "Brake noise in reverse").status_code, 400)
+
+    def test_full_editor_saves_linked_fields_and_preserves_complaint_review(self):
+        self.assertEqual(self.update(status="Resolved", notes="Brake repaired").status_code, 200)
+        self.job.refresh_from_db()
+        prior_complaints = self.job.complaints
+        url = self.url("editor")
+        baseline = self.client.get(url).data
+        patch = {
+            "versions": baseline["versions"],
+            "customer": {"name": "Updated Customer"},
+            "vehicle": {"registration": "KL10AA4321", "vin": "CHASSIS1234"},
+            "job": {
+                "serviceType": "Running Repair", "odometer": 52400,
+                "complaints": [{"id": "CMP-1", "description": "Brake noise in reverse"},
+                               {"id": "CMP-2"}, {"description": "Steering vibration"}],
+            },
+        }
+        edited = self.client.patch(url, patch, format="json")
+        self.assertEqual(edited.status_code, 200, edited.data)
+        self.assertEqual(edited.data["job"]["customerName"], "Updated Customer")
+        self.assertEqual(edited.data["job"]["vehicleReg"], "KL10AA4321")
+        self.assertEqual(edited.data["job"]["serviceType"], "Running Repair")
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.complaints[0]["statusHistory"], prior_complaints[0]["statusHistory"])
+        self.assertEqual(self.job.complaints[0]["status"], "Resolved")
+        self.assertEqual(self.job.complaints[1], prior_complaints[1])
+        self.assertEqual(self.job.complaints[2]["status"], "Pending")
+        self.assertEqual(self.client.patch(url, patch, format="json").status_code, 409)
+
+    def test_full_editor_rejects_partial_save_and_unauthorized_profile_edits(self):
+        url = self.url("editor")
+        baseline = self.client.get(url).data
+        invalid = self.client.patch(url, {
+            "versions": baseline["versions"],
+            "customer": {"name": "Do not save"},
+            "vehicle": {"registration": "??"},
+        }, format="json")
+        self.assertEqual(invalid.status_code, 400, invalid.data)
+        self.job.customer.refresh_from_db()
+        self.assertEqual(self.job.customer.name, "Customer")
+        staff_role = Role.objects.create(company=self.company, name="Job Editor",
+                                         code="JOB_ONLY", permissions=["jobs.view", "jobs.edit"], is_active=True)
+        staff = User.objects.create_user(email="edit-job-only@example.test", password="test-pass",
+                                         name="Editor", company=self.company, branch=self.branch, role=staff_role)
+        self.client.force_authenticate(user=staff)
+        data = self.client.get(url).data
+        self.assertFalse(data["access"]["customer"])
+        no_access = self.client.patch(url, {
+            "versions": data["versions"], "customer": {"name": "Do not save"},
+        }, format="json")
+        self.assertEqual(no_access.status_code, 403, no_access.data)
+
     def test_legacy_auto_completed_is_not_inferred_as_resolved(self):
         reply = self.client.get(self.url("").rstrip("/"))
         self.assertEqual(reply.status_code, 200, reply.data)
@@ -124,6 +204,7 @@ class ManualComplaintTests(TestCase):
         )
         self.client.force_authenticate(user=reader)
         self.assertEqual(self.update().status_code, 403)
+        self.assertEqual(self.edit().status_code, 403)
         foreign = Company.objects.create(name="Another", slug="another-complaint-workshop")
         foreign_role = Role.objects.create(company=foreign, name="Owner",
                                            code="FOREIGN_COMPLAINT_OWNER",
@@ -134,6 +215,7 @@ class ManualComplaintTests(TestCase):
         )
         self.client.force_authenticate(user=user)
         self.assertEqual(self.update().status_code, 404)
+        self.assertEqual(self.edit().status_code, 404)
 
     def test_status_validation_and_legacy_row_token(self):
         self.assertEqual(self.update(status="Completed").status_code, 400)

@@ -9,16 +9,16 @@ from collections import OrderedDict
 WORKFLOW_PACKAGES = OrderedDict((
     ("workshop_operations", {
         "label": "Workshop Operations",
-        "description": "Customers, vehicles, services, job cards, inventory/suppliers, invoices and customer updates.",
-        "modules": ("customers", "vehicles", "services", "jobs", "stock", "invoices", "notifications"),
+        "description": "Customers, vehicles, services, job cards, inventory/suppliers and invoices.",
+        "modules": ("customers", "vehicles", "services", "jobs", "stock", "invoices"),
         "flows": ("Customer → Vehicle → Job Card → Parts → Estimate → Invoice → Customer Updates",),
         "dependencies": (),
     }),
     ("accounts_tax", {
         "label": "Accounts & Tax",
-        "description": "Cash, UPI and bank payments, expense ledger, accounting and GST reports.",
-        "modules": ("payments", "expenses", "finance", "gstr"),
-        "flows": ("Invoice/Expense/Payroll → Payment → Ledger → GST and accounting",),
+        "description": "Cash, UPI and bank payments, expenses, accounting, GST returns and workshop reports.",
+        "modules": ("payments", "expenses", "finance", "gstr", "reports"),
+        "flows": ("Invoice/Expense/Payroll → Payment → Ledger → GST and reports",),
         "dependencies": ("workshop_operations",),
     }),
     ("attendance_payroll", {
@@ -28,14 +28,10 @@ WORKFLOW_PACKAGES = OrderedDict((
         "flows": ("Attendance & Shifts → Hours/OT → Wage Calculation → Payroll Approval",),
         "dependencies": (),
     }),
-    ("business_insights", {
-        "label": "Reports & Analytics",
-        "description": "Workshop analytics using only the data and underlying permissions already available.",
-        "modules": ("reports",),
-        "flows": ("Workshop and finance activity → Authorized reports",),
-        "dependencies": (),
-    }),
 ))
+
+LEGACY_REPORT_FEATURES = frozenset({"reports", "business_insights"})
+REPORTS_PACKAGE_MESSAGE = "Reports are now included in Accounts & Tax."
 
 # Storage remains an independent, usage-metered platform billing product;
 # the owner can inspect storage from SaaS Account without purchasing this module.
@@ -48,10 +44,9 @@ ALL_GROUPED_MODULES = frozenset(
 
 def billed_feature_keys(permission_module):
     """One package plus any pre-existing individual module subscription."""
-    key = next(
-        (key for key, info in WORKFLOW_PACKAGES.items()
-         if permission_module in info["modules"]), None
-    )
+    if permission_module == "reports":
+        return ("reports", "accounts_tax", "business_insights")
+    key = package_for(permission_module)
     return (permission_module, key) if key else (permission_module,)
 
 
@@ -61,6 +56,8 @@ def expand_entitlements(keys):
     for key, info in WORKFLOW_PACKAGES.items():
         if key in active:
             active.update(info["modules"])
+    if "business_insights" in active:
+        active.add("reports")
     return active
 
 
@@ -71,7 +68,9 @@ def legacy_only_workforce_bundle(keys):
 
 def legacy_individual_feature_bundle(keys):
     """Hide obsolete standalone products from *new* customers only."""
-    return bool(keys) and set(keys) <= ALL_GROUPED_MODULES and not (set(keys) & GROUP_KEYS)
+    # Old mixed labels can still reference Notifications alongside paid modules.
+    # Making it free must not turn those legacy labels into new offers.
+    return bool(keys) and set(keys) <= (ALL_GROUPED_MODULES | {"notifications"} | LEGACY_REPORT_FEATURES)
 
 
 def package_for(module):
