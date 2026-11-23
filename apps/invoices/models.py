@@ -2,6 +2,29 @@ from decimal import Decimal
 from django.db import models
 from common.models import CompanyOwnedModel
 
+class QuickService(CompanyOwnedModel):
+    description = models.CharField(max_length=255)
+    start_key = models.UUIDField()
+    start_fingerprint = models.CharField(max_length=64, blank=True, default="")
+    started_by = models.ForeignKey("accounts.User", on_delete=models.SET_NULL, null=True)
+    customer = models.ForeignKey(
+        "customers.Customer", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="quick_services",
+    )
+    vehicle = models.ForeignKey(
+        "vehicles.Vehicle", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="quick_services",
+    )
+    items = models.JSONField(default=list, blank=True)
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["company", "start_key"], name="unique_quick_service_start"),
+        ]
+
+
 class Invoice(CompanyOwnedModel):
     KIND=[("invoice","Invoice"),("estimate","Estimate")]
     number=models.CharField(max_length=50)
@@ -9,7 +32,8 @@ class Invoice(CompanyOwnedModel):
     invoice_type=models.CharField(max_length=20,default="regular")
     status=models.CharField(max_length=30,default="Draft")
     date=models.DateField()
-    customer=models.ForeignKey("customers.Customer",on_delete=models.PROTECT,related_name="invoices")
+    customer=models.ForeignKey("customers.Customer",on_delete=models.PROTECT,related_name="invoices",null=True)
+    quick_service=models.OneToOneField(QuickService,on_delete=models.PROTECT,related_name="invoice",null=True,blank=True)
     vehicle=models.ForeignKey("vehicles.Vehicle",on_delete=models.SET_NULL,null=True,blank=True,related_name="invoices")
     job=models.ForeignKey("jobs.Job",on_delete=models.SET_NULL,null=True,blank=True,related_name="invoices")
     seller_snapshot=models.JSONField(default=dict,blank=True)
@@ -43,7 +67,22 @@ class Invoice(CompanyOwnedModel):
     cancellation_reason=models.CharField(max_length=500,blank=True,default="")
     class Meta:
         ordering=["-date","-created_at"]
-        constraints=[models.UniqueConstraint(fields=["company","number"],name="unique_invoice_number_per_company")]
+        constraints=[
+            models.UniqueConstraint(fields=["company","number"],name="unique_invoice_number_per_company"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(quick_service__isnull=True, customer__isnull=False)
+                    | (
+                        models.Q(quick_service__isnull=False, job__isnull=True, kind="invoice")
+                        & (
+                            models.Q(customer__isnull=True, vehicle__isnull=True)
+                            | models.Q(customer__isnull=False)
+                        )
+                    )
+                ),
+                name="invoice_recipient_or_quick_service",
+            ),
+        ]
     def __str__(self): return self.number
 
 class InvoiceItem(models.Model):
